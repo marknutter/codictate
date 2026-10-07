@@ -22,6 +22,7 @@ import {
   type StreamSession,
   type StreamSessionEnd,
 } from './utils/whisper/parakeet-stream-runner'
+import { streamStopCommandFor } from '../shared/parakeet-stream-protocol'
 import {
   blockedDictationPlan,
   type BlockedDictationPlan,
@@ -712,9 +713,13 @@ export const setupRecording = (
   /**
    * End the running Live Transcription.
    *
-   * The helper is always stopped gracefully, even on Escape: it commits its last segment,
-   * restores the output volume it ducked, and exits. The Dictation pipeline stays held until
-   * it has, so a press in that window cannot start a second helper.
+   * The helper is always asked to exit, never killed first: it writes `final`, restores the
+   * output volume it ducked, and exits. A Dictation that pastes sends `stop`, which also
+   * transcribes the segment in progress; Escape and an app-initiated stop send `cancel`,
+   * which skips that pass, so the window below is milliseconds. The Dictation pipeline stays
+   * held until the helper has exited, so a press in that window cannot start a second helper,
+   * and `ready` is not reported until the pipeline is released: a press refused while the
+   * app still claims to be ready would be a press that silently did nothing.
    */
   const tryStopStream = async (intent: LiveStopIntent) => {
     if (streamSession === null || activeStreamPlan === null) return
@@ -733,23 +738,21 @@ export const setupRecording = (
     resetHoldGate()
     transcriptionPipelineActive = true
 
-    if (intent === 'commit') {
-      // Same order as a Batch Dictation: tray and indicator to transcribing, then the end
-      // chime. The helper's last segment and the pipeline both run under `transcribing`.
-      setTrayTranscribing()
-      onStatusChange?.('transcribing')
-      if (appConfig.getSoundEffectsEnabled())
-        playEndSound(appConfig.getFunModeEnabled())
-    } else {
-      setTrayIdle()
-      onStatusChange?.('ready')
-    }
+    // Same order as a Batch Dictation: tray and indicator to transcribing, then the end chime.
+    // The helper's last segment and the pipeline both run under `transcribing`. A cancel or an
+    // abandon is busy too until the helper exits - `releaseDictationPipeline` reports `ready`
+    // - but has no end chime: Escape already played the cancel chime, and an app-initiated
+    // stop is not the user ending a Dictation.
+    setTrayTranscribing()
+    onStatusChange?.('transcribing')
+    if (intent === 'commit' && appConfig.getSoundEffectsEnabled())
+      playEndSound(appConfig.getFunModeEnabled())
 
     // `finishLiveTranscription` is what releases the Dictation pipeline, so it must be reached
     // even if the stop itself throws.
     let end: StreamSessionEnd
     try {
-      end = await stopParakeetStream(session)
+      end = await stopParakeetStream(session, streamStopCommandFor(intent))
     } catch (err) {
       end = {
         status: 'failed',

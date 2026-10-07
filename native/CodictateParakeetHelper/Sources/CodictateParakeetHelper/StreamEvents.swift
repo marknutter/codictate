@@ -74,6 +74,7 @@ final class StreamEventSink: @unchecked Sendable {
 
 /// How Bun ends a stream session: `stop` on stdin, or stdin closing. SIGINT and SIGTERM mean
 /// the same thing, so a stop from a terminal or a process manager also ends the session cleanly.
+/// (`cancel` on stdin skips all of this; see `handleStreamCancel`.)
 ///
 /// A stop does not exit on the spot. It ends the audio loop, which transcribes the segment in
 /// progress before it writes `final` - otherwise the last words before a push-to-talk release
@@ -155,12 +156,32 @@ func installStreamStopHandlers(cleanup: @escaping @Sendable () -> Void) {
   StreamStopSources.sigint = sigint
   StreamStopSources.sigterm = sigterm
 
-  // Same contract as the Windows helper's recorder: a `stop` line, or EOF when the host goes
-  // away, so an orphaned helper does not keep the microphone open.
+  // Same contract as the Windows helper: a `stop` line, or EOF when the host goes away, so an
+  // orphaned helper does not keep the microphone open. A `cancel` line ends the session at once.
   Thread.detachNewThread {
+    var cancelled = false
     while let line = readLine() {
-      if line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "stop" { break }
+      let command = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      if command == "stop" { break }
+      if command == "cancel" {
+        cancelled = true
+        break
+      }
     }
-    handleStreamStop(source: "stdin", cleanup: cleanup)
+    if cancelled {
+      handleStreamCancel(cleanup: cleanup)
+    } else {
+      handleStreamStop(source: "stdin", cleanup: cleanup)
+    }
   }
+}
+
+/// `cancel` on stdin: Bun will not paste this session's text (Escape, or a stop the app made),
+/// so there is no reason to wait for the segment in progress. Commit the partial last written,
+/// if any, write `final` and exit 0 now, with no final transcription pass, so Bun can release
+/// the Dictation pipeline straight away. Safe against the audio loop and a stop watchdog: the
+/// sink's lock lets only one of them write `final`.
+private func handleStreamCancel(cleanup: @escaping @Sendable () -> Void) -> Never {
+  logPhase("stream: cancel requested (stdin) — finishing without a final pass")
+  StreamEventSink.shared.finishAndExit(cleanup: cleanup)
 }

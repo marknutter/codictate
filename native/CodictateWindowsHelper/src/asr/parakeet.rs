@@ -252,6 +252,11 @@ fn handle_stream_stop(session: &Arc<StreamSession>, source: &str) {
 /// away, or Bun closed the pipe after writing `stop`). Bun cannot signal a Windows process
 /// gracefully. Only the first of those counts: Bun writes `stop` and closes stdin straight
 /// after, and that close must not cut the drain short.
+///
+/// A `cancel` line ends the session at once instead: Bun will not paste this session's text
+/// (Escape, or a stop the app made), so it commits the partial last written, writes `final`
+/// and exits 0 with no final transcription pass, letting Bun release the Dictation pipeline
+/// straight away. The macOS helper reads the same two lines.
 fn spawn_stream_stdin_thread(session: Arc<StreamSession>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let stdin = io::stdin();
@@ -259,13 +264,39 @@ fn spawn_stream_stdin_thread(session: Arc<StreamSession>) -> thread::JoinHandle<
             let Ok(line) = line else {
                 break;
             };
-            if line.trim().eq_ignore_ascii_case("stop") {
-                handle_stream_stop(&session, "stdin stop");
-                return;
+            match stream_control_command(&line) {
+                Some(StreamControlCommand::Stop) => {
+                    handle_stream_stop(&session, "stdin stop");
+                    return;
+                }
+                Some(StreamControlCommand::Cancel) => {
+                    log_phase("stream: cancel requested (stdin) - finishing without a final pass");
+                    session.events.finish_and_exit();
+                }
+                None => {}
             }
         }
         handle_stream_stop(&session, "stdin closed");
     })
+}
+
+/// A line Bun writes to a stream session's stdin. `src/shared/parakeet-stream-protocol.ts`
+/// (`StreamStopCommand`) is the other side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamControlCommand {
+    Stop,
+    Cancel,
+}
+
+fn stream_control_command(line: &str) -> Option<StreamControlCommand> {
+    let line = line.trim();
+    if line.eq_ignore_ascii_case("stop") {
+        Some(StreamControlCommand::Stop)
+    } else if line.eq_ignore_ascii_case("cancel") {
+        Some(StreamControlCommand::Cancel)
+    } else {
+        None
+    }
 }
 
 fn log_phase(message: impl AsRef<str>) {

@@ -17,6 +17,7 @@ import {
   LiveTranscript,
   parseParakeetStreamEvent,
   type LiveTranscriptSnapshot,
+  type StreamStopCommand,
 } from '../../../shared/parakeet-stream-protocol'
 import { modelManager } from './model-manager'
 import { awaitParakeetWarmup } from './parakeet-warmup'
@@ -304,17 +305,19 @@ export async function startParakeetStream(
 /**
  * Ask the helper to end the session and wait for it to exit.
  *
- * The helper commits the segment in progress and writes `final` before it exits, so this
- * waits for that rather than killing it. Only a helper that misses the deadline is killed,
- * and `session.ended` then reports it as failed.
+ * With `stop` the helper commits the segment in progress and writes `final` before it exits,
+ * so this waits for that rather than killing it. With `cancel` it skips that final pass and
+ * exits at once (`StreamStopCommand`). Only a helper that misses the deadline is killed, and
+ * `session.ended` then reports it as failed.
  */
 export async function stopParakeetStream(
-  session: StreamSession
+  session: StreamSession,
+  command: StreamStopCommand = 'stop'
 ): Promise<StreamSessionEnd> {
   const stdin = session.proc.stdin
   if (stdin && typeof stdin !== 'number') {
     try {
-      stdin.write('stop\n')
+      stdin.write(`${command}\n`)
       void stdin.flush()
       void stdin.end()
     } catch {
@@ -334,6 +337,7 @@ export async function stopParakeetStream(
     log('stream', 'parakeet helper missed the stop deadline, killing it', {
       streamDebugId: session.streamDebugId,
       deadlineMs: STREAM_STOP_DEADLINE_MS,
+      command,
     })
     session.proc.kill('SIGKILL')
   }

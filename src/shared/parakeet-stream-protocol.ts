@@ -55,6 +55,30 @@ export function parseParakeetStreamEvent(
 }
 
 /**
+ * The line Bun writes to a stream helper's stdin to end the session.
+ *
+ * - `stop` - finish normally: the helper transcribes the segment in progress, commits it,
+ *   writes `final` and exits 0, within its own drain deadline.
+ * - `cancel` - finish now: the helper commits the partial it last reported, if any, writes
+ *   `final` and exits 0 with no final transcription pass. For a session whose text will not
+ *   be pasted, so the Dictation pipeline is released in milliseconds rather than after a pass.
+ *
+ * Both helpers also treat stdin closing as `stop`.
+ */
+export type StreamStopCommand = 'stop' | 'cancel'
+
+/**
+ * Which stop line a Live Transcription ending sends. Only an ending that pastes (`commit`)
+ * needs the final pass; Escape (`cancel`) and an app-initiated stop (`abandon`) do not, and
+ * the shortcut is refused until the helper has exited.
+ */
+export function streamStopCommandFor(
+  intent: 'commit' | 'cancel' | 'abandon'
+): StreamStopCommand {
+  return intent === 'commit' ? 'stop' : 'cancel'
+}
+
+/**
  * What the Staging Overlay needs from a running transcript: the whole visible text, and the
  * part of it that is committed. `text` always starts with `committedText`; the rest is the
  * partial for the segment in progress, which Parakeet may still revise.
