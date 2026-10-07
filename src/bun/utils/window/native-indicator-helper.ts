@@ -2,6 +2,7 @@ import { findBinary } from '../../platform/binaries'
 import type { AppStatus, ThemePreference } from '../../../shared/types'
 import { getPlatformRuntime } from '../../platform/runtime'
 import { indicatorWireStatus } from './indicator-state'
+import type { StagingOverlayText } from './staging-overlay-text'
 
 type MoveEvent = { type: 'move'; x?: number; y?: number }
 
@@ -14,6 +15,11 @@ export type NativeIndicatorHelper = {
   hide: () => void
   setStatus: (status: AppStatus) => void
   setTheme: (theme: ThemePreference) => void
+  /**
+   * The Staging Overlay's text. Both parts empty collapses the overlay back to the orb.
+   * See the `text` command in docs/RECORDING_INDICATOR.md.
+   */
+  setText: (text: StagingOverlayText) => void
   dispose: () => void
 }
 
@@ -87,6 +93,13 @@ export function createNativeIndicatorHelper(
     },
     setTheme(theme) {
       send({ command: 'theme', theme })
+    },
+    setText(text) {
+      send({
+        command: 'text',
+        committed: text.committed,
+        partial: text.partial,
+      })
     },
     dispose() {
       try {

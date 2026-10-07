@@ -54,6 +54,16 @@ export function parseParakeetStreamEvent(
   return null
 }
 
+/**
+ * What the Staging Overlay needs from a running transcript: the whole visible text, and the
+ * part of it that is committed. `text` always starts with `committedText`; the rest is the
+ * partial for the segment in progress, which Parakeet may still revise.
+ */
+export interface LiveTranscriptSnapshot {
+  text: string
+  committedText: string
+}
+
 /** Collapses whitespace runs so segments join with exactly one space. */
 function normaliseSegment(text: string): string {
   return text.trim().replace(/\s+/g, ' ')
@@ -95,6 +105,16 @@ export class LiveTranscript {
   /** Committed segments and the current partial, joined with single spaces. */
   text(): string {
     return this.join(this.partial)
+  }
+
+  /** The committed segments only, joined with single spaces. No partial. */
+  committedText(): string {
+    return this.segments.join(' ')
+  }
+
+  /** `text()` and `committedText()` together, for the Staging Overlay. */
+  snapshot(): LiveTranscriptSnapshot {
+    return { text: this.text(), committedText: this.committedText() }
   }
 
   /**

@@ -16,6 +16,7 @@ import {
 import {
   LiveTranscript,
   parseParakeetStreamEvent,
+  type LiveTranscriptSnapshot,
 } from '../../../shared/parakeet-stream-protocol'
 import { modelManager } from './model-manager'
 import { awaitParakeetWarmup } from './parakeet-warmup'
@@ -35,9 +36,10 @@ const STDERR_TAIL_LINES = 20
 export type StreamHandlers = {
   /**
    * The running transcript changed: committed segments plus the current partial. Called on
-   * every visible change, for the Staging Overlay to draw.
+   * every visible change, for the Staging Overlay to draw, with the committed part split out
+   * so the overlay can style it apart from the partial Parakeet may still revise.
    */
-  onText?: (text: string) => void
+  onText?: (transcript: LiveTranscriptSnapshot) => void
 }
 
 /**
@@ -251,7 +253,7 @@ export async function startParakeetStream(
         text: text.slice(-200),
         streamDebugId,
       })
-      handlers.onText?.(text)
+      handlers.onText?.(transcript.snapshot())
     }
   }).catch((err) => {
     log('stream', 'parakeet stdout read error', { err: String(err) })

@@ -43,6 +43,7 @@ import {
 } from './utils/sound/play-sound'
 import { AppConfig } from './AppConfig/AppConfig'
 import type { TrayHandlers } from './setup-tray'
+import type { LiveTranscriptUpdate } from './utils/window/staging-overlay-text'
 import { findDevices, type AudioDeviceSnapshot } from './utils/audio/devices'
 import {
   resolveInputDevice,
@@ -142,9 +143,11 @@ export const setupRecording = (
   onDictationFailed?: (failure: FailedTranscription) => Promise<void>,
   /**
    * The running transcript of a Live Transcription changed: committed segments plus the
-   * current partial. For the Staging Overlay to draw; nothing is pasted until the end.
+   * current partial, and the Transcription Language of the plan the stream started with, so
+   * the overlay applies the Scratch Command by the same rule the paste does. For the Staging
+   * Overlay to draw; nothing is pasted until the end.
    */
-  onLiveTranscriptText?: (text: string) => void
+  onLiveTranscriptText?: (update: LiveTranscriptUpdate) => void
 ) => {
   let recorderProc: ReturnType<typeof Bun.spawn> | null = null
   let recordingSession: RecordingSession | null = null
@@ -629,7 +632,11 @@ export const setupRecording = (
         plan,
         appConfig.getStreamTranscriptionMode(),
         {
-          onText: (text) => onLiveTranscriptText?.(text),
+          onText: (transcript) =>
+            onLiveTranscriptText?.({
+              ...transcript,
+              transcriptionLanguageId: plan.transcriptionLanguageId,
+            }),
         },
         {
           streamDebugId,
