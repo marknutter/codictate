@@ -7,9 +7,17 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { AppStatus, RecordingIndicatorMode } from '../../../shared/types'
-import { indicatorShouldBeVisible, indicatorWireStatus } from './indicator-state'
+import {
+  indicatorShouldBeVisible,
+  indicatorWireStatus,
+} from './indicator-state'
 
-const ALL_STATUSES: AppStatus[] = ['ready', 'recording', 'transcribing', 'streaming']
+const ALL_STATUSES: AppStatus[] = [
+  'ready',
+  'recording',
+  'transcribing',
+  'streaming',
+]
 const ALL_MODES: RecordingIndicatorMode[] = ['off', 'always', 'when-active']
 const WIRE_STATES = ['ready', 'recording', 'transcribing'] as const
 
@@ -54,14 +62,36 @@ describe('indicatorShouldBeVisible', () => {
   })
 
   test('full mode x status matrix', () => {
-    const expected: Record<RecordingIndicatorMode, Record<AppStatus, boolean>> = {
-      off: { ready: false, recording: false, transcribing: false, streaming: false },
-      always: { ready: true, recording: true, transcribing: true, streaming: true },
-      'when-active': { ready: false, recording: true, transcribing: true, streaming: true },
+    const expected: Record<
+      RecordingIndicatorMode,
+      Record<AppStatus, boolean>
+    > = {
+      off: {
+        ready: false,
+        recording: false,
+        transcribing: false,
+        streaming: false,
+      },
+      always: {
+        ready: true,
+        recording: true,
+        transcribing: true,
+        streaming: true,
+      },
+      'when-active': {
+        ready: false,
+        recording: true,
+        transcribing: true,
+        streaming: true,
+      },
     }
     for (const mode of ALL_MODES) {
       for (const status of ALL_STATUSES) {
-        expect({ mode, status, visible: indicatorShouldBeVisible(mode, status) }).toEqual({
+        expect({
+          mode,
+          status,
+          visible: indicatorShouldBeVisible(mode, status),
+        }).toEqual({
           mode,
           status,
           visible: expected[mode][status],
@@ -96,9 +126,14 @@ describe('indicatorWireStatus', () => {
     expect(indicatorWireStatus('transcribing')).toBe('transcribing')
   })
 
-  test.each(ALL_STATUSES)('status %s maps to one of the three wire states', (status) => {
-    expect(WIRE_STATES as readonly string[]).toContain(indicatorWireStatus(status))
-  })
+  test.each(ALL_STATUSES)(
+    'status %s maps to one of the three wire states',
+    (status) => {
+      expect(WIRE_STATES as readonly string[]).toContain(
+        indicatorWireStatus(status)
+      )
+    }
+  )
 
   test('never sends streaming over the wire', () => {
     for (const status of ALL_STATUSES) {
