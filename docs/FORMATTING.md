@@ -1,6 +1,6 @@
 # Output formatting
 
-Formatting rewrites a completed Batch Dictation before Codictate pastes it. Live Transcription bypasses formatting.
+Formatting rewrites a completed Dictation before Codictate pastes it. That includes Live Transcription: its staged text goes through the same Dictionary and Formatting Mode when the Dictation ends, and is pasted once.
 
 ## Models
 
