@@ -9,7 +9,11 @@ import type { AudioDeviceDetails } from '../../../shared/types'
 import { resolveInputDevice } from './resolve-input-device'
 
 const macList = {
-  devices: { '0': 'MacBook Pro Microphone', '1': 'AirPods Pro', '2': 'Shure MV7' },
+  devices: {
+    '0': 'MacBook Pro Microphone',
+    '1': 'AirPods Pro',
+    '2': 'Shure MV7',
+  },
   details: {} as Record<string, AudioDeviceDetails>,
 }
 
@@ -192,7 +196,9 @@ describe('resolveInputDevice — no microphone chosen (id and name both null)', 
 
   test('index resolution on Windows carries the endpoint id', () => {
     const list = winList([['4', 'USB Mic', WIN_C]])
-    expect(resolveInputDevice({ id: null, name: null, index: 4 }, list)).toEqual({
+    expect(
+      resolveInputDevice({ id: null, name: null, index: 4 }, list)
+    ).toEqual({
       status: 'found',
       index: 4,
       label: 'USB Mic',
