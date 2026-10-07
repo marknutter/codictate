@@ -260,9 +260,20 @@ async function runParakeetWarmup(speechModelId: string): Promise<boolean> {
   }
 }
 
-function createSilentWav(): Uint8Array {
+/**
+ * FluidAudio rejects anything under one second of 16 kHz audio with `invalidAudioData`, so the
+ * warmup clip must be at least that long. At 0.5 s every preparation failed before it compiled
+ * anything, and `parakeetCoreMlReady` never became true. Exactly one second transcribes to an
+ * empty string; longer silence can make Parakeet hallucinate words, which a warmup ignores
+ * but has no reason to invite. The Windows helper's parakeet-rs 0.3.5 has no minimum beyond
+ * rejecting empty audio, so one second satisfies both platforms.
+ */
+export const PARAKEET_WARMUP_SECONDS = 1
+
+/** A mono 16-bit PCM WAV of silence, `PARAKEET_WARMUP_SECONDS` long at 16 kHz. */
+export function createSilentWav(): Uint8Array {
   const sampleRate = 16000
-  const numSamples = Math.floor(sampleRate * 0.5)
+  const numSamples = Math.floor(sampleRate * PARAKEET_WARMUP_SECONDS)
   const dataSize = numSamples * 2
   const buf = new Uint8Array(44 + dataSize)
   const view = new DataView(buf.buffer)
