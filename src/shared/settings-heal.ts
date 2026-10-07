@@ -237,6 +237,41 @@ export function healDictationSettings(
 }
 
 /**
+ * Which heal pass owns each target. A `Record`, so a new target cannot compile without being
+ * assigned to one.
+ */
+const HEAL_TARGET_OWNER: Record<SettingsHealTarget, 'speech' | 'formatting'> = {
+  speech_model: 'speech',
+  translate_to_english: 'speech',
+  live_transcription: 'speech',
+  self_correction_cleanup: 'formatting',
+}
+
+/** Whether `healDictationSettings` (the Speech Model heal pass) owns this target. */
+export function isSpeechHealTarget(target: SettingsHealTarget): boolean {
+  return HEAL_TARGET_OWNER[target] === 'speech'
+}
+
+/**
+ * The announcements to show after a Speech Model heal pass or settings write: its own
+ * announcements replace every earlier speech-side one, and the rest - Self-correction
+ * Cleanup's, which a different pass writes - are kept as they were. The two passes run
+ * independently and an unread notice from one must not be erased by the other. Pass an empty
+ * list to retire only the speech-side announcements. Neither input is mutated.
+ */
+export function mergeSpeechHealAnnouncements(
+  current: readonly SettingsHealAnnouncement[],
+  speechAnnouncements: readonly SettingsHealAnnouncement[]
+): SettingsHealAnnouncement[] {
+  return [
+    ...speechAnnouncements,
+    ...current.filter(
+      (announcement) => !isSpeechHealTarget(announcement.target)
+    ),
+  ]
+}
+
+/**
  * Whole-object validation: a settings object is runnable exactly when the heal pass has
  * nothing to do to it. One definition, so the validator and the heal pass cannot drift.
  */

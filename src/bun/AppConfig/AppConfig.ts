@@ -43,6 +43,7 @@ import {
 import {
   applyRunnableDictationPatch,
   healDictationSettings,
+  mergeSpeechHealAnnouncements,
   type RunnableDictationSettings,
   type SettingsHealAnnouncement,
 } from '../../shared/settings-heal'
@@ -1049,7 +1050,12 @@ export class AppConfig {
     announcements: SettingsHealAnnouncement[]
   ): void {
     if (announcements.length === 0) return
-    this.healAnnouncements = announcements
+    // Replace only what the Speech Model heal pass owns: an unread Self-correction Cleanup
+    // notice from its own pass is still true and stays.
+    this.healAnnouncements = mergeSpeechHealAnnouncements(
+      this.healAnnouncements,
+      announcements
+    )
     for (const announcement of announcements) {
       log('config', 'healed settings', {
         target: announcement.target,
@@ -1101,7 +1107,11 @@ export class AppConfig {
         options?.retireSettledAnnouncements === true &&
         this.healAnnouncements.length > 0
       ) {
-        this.healAnnouncements = []
+        // Only this pass's own notices are settled; Self-correction Cleanup's are not.
+        this.healAnnouncements = mergeSpeechHealAnnouncements(
+          this.healAnnouncements,
+          []
+        )
       }
       // Still a settled `(settings, availability)` pair, and the availability half may be
       // what moved: a finished Parakeet download changes nothing about the settings and is
