@@ -4,6 +4,7 @@ import {
   LiveTranscript,
   parseParakeetStreamEvent,
   type ParakeetStreamEvent,
+  streamStopCommandFor,
 } from './parakeet-stream-protocol'
 
 const partial = (text: string): ParakeetStreamEvent => ({
@@ -212,5 +213,26 @@ describe('LiveTranscript', () => {
     transcript.apply(partial(''))
     expect(transcript.text()).toBe('Hello.')
     expect(transcript.finalText()).toBe('Hello.')
+  })
+})
+
+describe('streamStopCommandFor', () => {
+  test('a normal stop that pastes sends stop, so the segment in progress is transcribed', () => {
+    expect(streamStopCommandFor('commit')).toBe('stop')
+  })
+
+  test('Escape sends cancel, skipping the final transcription pass', () => {
+    expect(streamStopCommandFor('cancel')).toBe('cancel')
+  })
+
+  test('an app-initiated abandon sends cancel, skipping the final transcription pass', () => {
+    expect(streamStopCommandFor('abandon')).toBe('cancel')
+  })
+
+  test('only the pasting stop asks for a final pass', () => {
+    const intents = ['commit', 'cancel', 'abandon'] as const
+    expect(
+      intents.filter((intent) => streamStopCommandFor(intent) === 'stop')
+    ).toEqual(['commit'])
   })
 })

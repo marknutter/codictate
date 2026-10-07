@@ -11,8 +11,12 @@ import {
   applyRunnableDictationPatch,
   healDictationSettings,
   isRunnableDictationSettings,
+  isSpeechHealTarget,
+  mergeSpeechHealAnnouncements,
   type RunnableDictationSettings,
+  type SettingsHealAnnouncement,
   type SettingsHealReason,
+  type SettingsHealTarget,
 } from './settings-heal'
 import {
   DEFAULT_MODEL_ID,
@@ -677,5 +681,127 @@ describe('isRunnableDictationSettings', () => {
         availability([])
       )
     ).toBe(false)
+  })
+})
+
+describe('isSpeechHealTarget', () => {
+  test('the Speech Model selection, Translate to English and Live Transcription are speech-side', () => {
+    const speech: SettingsHealTarget[] = [
+      'speech_model',
+      'translate_to_english',
+      'live_transcription',
+    ]
+    for (const target of speech) {
+      expect(isSpeechHealTarget(target)).toBe(true)
+    }
+  })
+
+  test('Self-correction Cleanup is not speech-side', () => {
+    expect(isSpeechHealTarget('self_correction_cleanup')).toBe(false)
+  })
+})
+
+describe('mergeSpeechHealAnnouncements', () => {
+  const speechModel: SettingsHealAnnouncement = {
+    target: 'speech_model',
+    reason: 'speech_model_not_installed',
+    message: 'The selected Speech Model is not installed.',
+  }
+  const translate: SettingsHealAnnouncement = {
+    target: 'translate_to_english',
+    reason: 'model_cannot_translate',
+    message: 'Translate to English was turned off.',
+  }
+  const live: SettingsHealAnnouncement = {
+    target: 'live_transcription',
+    reason: 'parakeet_not_installed',
+    message: 'Live Transcription was turned off.',
+  }
+  const cleanupRuntime: SettingsHealAnnouncement = {
+    target: 'self_correction_cleanup',
+    reason: 'formatting_runtime_missing',
+    message: 'Self-correction Cleanup was turned off: no runtime.',
+  }
+  const cleanupModel: SettingsHealAnnouncement = {
+    target: 'self_correction_cleanup',
+    reason: 'formatting_model_not_installed',
+    message: 'Self-correction Cleanup was turned off: no model.',
+  }
+
+  test('a new speech heal replaces the earlier speech-side announcements', () => {
+    const merged = mergeSpeechHealAnnouncements(
+      [speechModel, translate],
+      [live]
+    )
+    expect(merged).toEqual([live])
+  })
+
+  test('an unread Self-correction Cleanup announcement survives a speech heal', () => {
+    const merged = mergeSpeechHealAnnouncements(
+      [speechModel, cleanupRuntime],
+      [translate]
+    )
+    expect(merged).toHaveLength(2)
+    expect(merged).toContainEqual(cleanupRuntime)
+    expect(merged).toContainEqual(translate)
+    expect(merged).not.toContainEqual(speechModel)
+  })
+
+  test('an empty speech result removes only the speech-side announcements', () => {
+    const merged = mergeSpeechHealAnnouncements(
+      [speechModel, cleanupRuntime, live],
+      []
+    )
+    expect(merged).toEqual([cleanupRuntime])
+  })
+
+  test('an empty speech result over only speech-side announcements leaves nothing', () => {
+    expect(mergeSpeechHealAnnouncements([speechModel, live], [])).toEqual([])
+  })
+
+  test('merging into an empty list yields the speech announcements', () => {
+    const merged = mergeSpeechHealAnnouncements([], [speechModel, live])
+    expect(merged).toHaveLength(2)
+    expect(merged).toContainEqual(speechModel)
+    expect(merged).toContainEqual(live)
+  })
+
+  test('kept non-speech announcements stay in their original order', () => {
+    const merged = mergeSpeechHealAnnouncements(
+      [cleanupModel, speechModel, cleanupRuntime],
+      [translate]
+    )
+    const kept = merged.filter(
+      (announcement) => announcement.target === 'self_correction_cleanup'
+    )
+    expect(kept).toEqual([cleanupModel, cleanupRuntime])
+  })
+
+  test('re-announcing the same speech-side notice does not duplicate it', () => {
+    const merged = mergeSpeechHealAnnouncements(
+      [speechModel, cleanupRuntime],
+      [speechModel]
+    )
+    expect(merged).toHaveLength(2)
+    expect(
+      merged.filter((announcement) => announcement.target === 'speech_model')
+    ).toHaveLength(1)
+    expect(merged).toContainEqual(cleanupRuntime)
+  })
+
+  test('merging the same speech result twice is stable', () => {
+    const once = mergeSpeechHealAnnouncements([cleanupRuntime], [live])
+    const twice = mergeSpeechHealAnnouncements(once, [live])
+    expect(twice).toEqual(once)
+  })
+
+  test('neither input is mutated', () => {
+    const current = [speechModel, cleanupRuntime]
+    const speech = [translate]
+    const currentCopy = structuredClone(current)
+    const speechCopy = structuredClone(speech)
+    mergeSpeechHealAnnouncements(current, speech)
+    expect(current).toEqual(currentCopy)
+    expect(speech).toEqual(speechCopy)
   })
 })

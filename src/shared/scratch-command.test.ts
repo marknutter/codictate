@@ -8,6 +8,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   applyScratchCommand,
   scratchCommandAppliesToLanguage,
+  stagedTextForHistory,
 } from './scratch-command'
 
 describe('applyScratchCommand - removing the phrase before the command', () => {
@@ -202,5 +203,50 @@ describe('scratchCommandAppliesToLanguage', () => {
     for (const id of ['da', 'de', 'fr', 'es', 'sv', 'nl', 'ja']) {
       expect(scratchCommandAppliesToLanguage(id)).toBe(false)
     }
+  })
+})
+
+describe('stagedTextForHistory', () => {
+  test('applies the Scratch Command for English', () => {
+    expect(
+      stagedTextForHistory('Meet at three. Bring cake scratch that', 'en')
+    ).toBe('Meet at three.')
+  })
+
+  test('applies the Scratch Command for auto-detected language', () => {
+    expect(
+      stagedTextForHistory('Meet at three. Bring cake scratch that', 'auto')
+    ).toBe('Meet at three.')
+  })
+
+  test('leaves the text as spoken for a language the command does not apply to', () => {
+    expect(
+      stagedTextForHistory('Meet at three. Bring cake scratch that', 'da')
+    ).toBe('Meet at three. Bring cake scratch that')
+  })
+
+  test('trims surrounding whitespace for an applying language', () => {
+    expect(stagedTextForHistory('  Hello world.  ', 'en')).toBe('Hello world.')
+  })
+
+  test('trims surrounding whitespace for a non-applying language', () => {
+    expect(stagedTextForHistory('  Hej verden.  \n', 'da')).toBe('Hej verden.')
+  })
+
+  test('text without the command comes back unchanged apart from trimming', () => {
+    expect(stagedTextForHistory('Hello world. Bring cake.', 'en')).toBe(
+      'Hello world. Bring cake.'
+    )
+  })
+
+  test('an entirely scratched text yields an empty string', () => {
+    expect(stagedTextForHistory('Bring cake scratch that', 'en')).toBe('')
+    expect(stagedTextForHistory('Bring cake scratch that', 'auto')).toBe('')
+  })
+
+  test('an empty or whitespace-only text yields an empty string', () => {
+    expect(stagedTextForHistory('', 'en')).toBe('')
+    expect(stagedTextForHistory('   \n\t ', 'en')).toBe('')
+    expect(stagedTextForHistory('   ', 'da')).toBe('')
   })
 })
