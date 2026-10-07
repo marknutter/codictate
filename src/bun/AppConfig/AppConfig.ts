@@ -66,6 +66,7 @@ import {
   withBuiltinDictionaryEntries,
 } from './state-helpers'
 import { disableDebug, enableDebug, log } from '../utils/logger'
+import type { InputDeviceSelection } from '../utils/audio/resolve-input-device'
 import {
   invalidateDictionaryCandidatesForText as getInvalidatedDictionaryCandidatesForText,
   parseDictionaryCandidates,
@@ -1485,6 +1486,15 @@ export class AppConfig {
     }
     await this.saveMain()
     return true
+  }
+
+  /** The microphone the user chose, for `resolveInputDevice`. */
+  public getInputDeviceSelection(): InputDeviceSelection {
+    return {
+      id: this.audioDeviceId,
+      name: this.audioDeviceName,
+      index: this.audioDevice,
+    }
   }
 
   public resolveAudioDevice(

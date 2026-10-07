@@ -424,6 +424,12 @@ export type DictationBlockedReason =
    * snapshot reaches it.
    */
   | 'parakeet_helper_missing'
+  /**
+   * The microphone chosen in Codictate is not connected. Like `parakeet_helper_missing`, only
+   * the pre-spawn check sees it: it is a hardware state, not a settings state, so there is
+   * nothing to heal - the choice stands for when the microphone comes back.
+   */
+  | 'microphone_missing'
 
 /** A Dictation that will run, exactly as described. Nothing downstream re-derives a field. */
 export interface RunnableDictationPlan {
@@ -490,6 +496,8 @@ const BLOCKED_MESSAGES: Record<
     `Live transcription cannot start because ${PARAKEET_LABEL} does not support the selected transcription language.`,
   parakeet_helper_missing: () =>
     `Live transcription cannot start because the ${PARAKEET_LABEL} helper is missing from this installation. Reinstalling Codictate restores it.`,
+  microphone_missing: () =>
+    'Dictation stopped because the selected microphone is not connected. Reconnect it, or choose another microphone in Settings.',
 }
 
 /**

@@ -1,7 +1,6 @@
 import { AppConfig } from '../../AppConfig/AppConfig'
 import { duckDelayAfterStartChimeMs } from '../sound/play-sound'
 import { findMicRecorderBinary } from './find-mic-recorder'
-import { findDevices, type AudioDeviceSnapshot } from './devices'
 import { log } from '../logger'
 import { stat } from 'node:fs/promises'
 import { RECORDING_PATH } from '../../platform/runtime'
@@ -96,8 +95,8 @@ export const startRecording = async (
    * before the mic process exits, so the answer only exists at this moment.
    */
   onCaptureFinished: (capture: CaptureResult) => Promise<void>,
-  /** Live snapshot from the main process (refreshed at startup + on an interval). Avoids spawning `MicRecorder --list-devices` on every shortcut press. */
-  getDeviceSnapshot?: () => AudioDeviceSnapshot
+  /** The microphone, already resolved by the caller: endpoint id or index (`resolveInputDevice`). */
+  deviceRef: string
 ) => {
   if (plan.mode !== 'batch') {
     log(
@@ -107,40 +106,7 @@ export const startRecording = async (
   }
 
   const micPath = await findMicRecorderBinary()
-
-  let currentSnapshot = getDeviceSnapshot?.() ?? { devices: {}, details: {} }
-  if (Object.keys(currentSnapshot.devices).length === 0) {
-    currentSnapshot = await findDevices()
-  }
-  const currentDevices = currentSnapshot.devices
-  const currentDeviceDetails = currentSnapshot.details
-  const resolved = appConfig.resolveAudioDevice(
-    currentDevices,
-    currentDeviceDetails
-  )
-
-  const deviceExists = resolved.toString() in currentDevices
-  const device = deviceExists
-    ? resolved
-    : Number(Object.keys(currentDevices)[0] ?? '0')
-
-  if (!deviceExists) {
-    console.warn(
-      `[recording] device ${resolved} not available, falling back to device ${device} (${currentDevices[device.toString()] ?? 'unknown'})`
-    )
-  }
-
-  const deviceLabel = currentDevices[device.toString()]?.trim() || 'default'
-  const deviceId = currentDeviceDetails[device.toString()]?.id ?? null
-
-  log('mic', 'resolved audio device', {
-    index: device,
-    name: deviceLabel,
-    requestedIndex: resolved,
-    endpointId: deviceId ?? undefined,
-    deviceExists,
-    binary: micPath,
-  })
+  log('mic', 'starting recorder', { deviceRef, binary: micPath })
 
   const maxRecordSeconds = appConfig.getMaxRecordingDurationSeconds()
   const outputDuckDelayMs = appConfig.getSoundEffectsEnabled()
@@ -155,7 +121,7 @@ export const startRecording = async (
       micPath,
       'record',
       RECORDING_PATH,
-      deviceId ?? String(device),
+      deviceRef,
       String(maxRecordSeconds),
       String(outputDuckDelayMs),
       String(duckLevel),
