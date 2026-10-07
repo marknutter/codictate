@@ -17,9 +17,11 @@
  * the failure sentences are covered by the default `bun test` run. The spawning lives in
  * `crispasr-engine.ts` and `parakeet-engine.ts`.
  *
- * Live Transcription is outside this interface on purpose: the Parakeet Native Helper
- * captures, transcribes and pastes for itself, so there is no result to return. See
- * docs/adr/0006-dictation-returns-an-outcome.md.
+ * Live Transcription is outside this interface on purpose: it is a session the Parakeet
+ * Native Helper streams events from, not one request with one result. Its staged text joins
+ * the Dictation pipeline after the engine, in `outcomeFromTranscript`. See
+ * docs/adr/0006-dictation-returns-an-outcome.md and
+ * docs/adr/0008-live-transcription-stages-in-an-overlay.md.
  */
 
 import type { CrispasrBackendId } from '../../../../shared/asr-harness'
@@ -109,6 +111,12 @@ export type TranscriptionFailureReason =
   | 'parakeet_no_final_line'
   /** The engine wrote bytes that are not the UTF-8 it was asked for. */
   | 'engine_output_unreadable'
+  /**
+   * The Parakeet Native Helper ended a Live Transcription without finishing it: a non-zero
+   * exit, a signal, or an exit that never wrote the `final` event. Nothing is pasted, and the
+   * text staged so far goes to History so the words are not lost. ADR-0008.
+   */
+  | 'live_transcription_interrupted'
 
 /**
  * A Speech Engine run that produced nothing, and the sentence to say so.
@@ -167,6 +175,8 @@ const TRANSCRIPTION_FAILURE_MESSAGES: Record<
     `Dictation stopped because ${label} finished without returning a transcript. Nothing was pasted.`,
   engine_output_unreadable: (label) =>
     `Dictation stopped because ${label} returned output Codictate could not read. Nothing was pasted.`,
+  live_transcription_interrupted: (label) =>
+    `Dictation stopped because ${label} quit during Live Transcription. Nothing was pasted, and any text it had transcribed was saved to History.`,
 }
 
 /**
@@ -218,7 +228,7 @@ export interface SpeechModelLocations {
  * rather than a process-global, and the resolved weights path.
  *
  * Batch only. A live plan never reaches this: Live Transcription is a session the Parakeet
- * Native Helper runs for itself, with no Request and no Result.
+ * Native Helper streams events from, with no Request and no Result.
  */
 export function transcriptionRequestFromPlan(
   plan: RunnableDictationPlan,

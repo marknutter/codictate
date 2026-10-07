@@ -1,6 +1,6 @@
 /**
- * One Batch Dictation, end to end: a runnable Dictation Plan and a captured WAV in, a
- * **Dictation Outcome** out.
+ * The Dictation pipeline: a runnable Dictation Plan and either a captured WAV or a staged
+ * transcript in, a **Dictation Outcome** out.
  *
  * It does not paste. A transcript could not be obtained from Codictate without pasting it
  * into whatever app had focus, which is what made history, stats and the clipboard the mic
@@ -14,8 +14,12 @@
  * `RECORDING_PATH`. What is left is the order of the rewrites: the shipped brand table, the
  * user Dictionary, then the Formatting Mode.
  *
- * Live Transcription does not come through here. The Parakeet Native Helper captures,
- * transcribes and pastes for itself, so there is no Outcome to return.
+ * Two entries, one pipeline. `runDictation` is a Batch Dictation: it asks the Speech Engine
+ * for a transcript and hands it on. `outcomeFromTranscript` is everything after the engine, and
+ * Live Transcription enters there with the text it staged while the user spoke - the Parakeet
+ * Native Helper already transcribed it, so asking an engine again would discard what the user
+ * watched appear. Both reach the Dictionary and the Formatting Mode through the same code.
+ * See docs/adr/0008-live-transcription-stages-in-an-overlay.md.
  */
 
 import type { RunnableDictationPlan } from '../../shared/dictation-plan'
@@ -35,12 +39,14 @@ import {
 import { modelManager } from '../utils/whisper/model-manager'
 import { fixBrandMishearings } from './brand-mishearings'
 
-export interface DictationRunRequest {
+/** What every Dictation brings to the pipeline, whichever entry it takes. */
+interface DictationPipelineRequest {
   /** Decided once, before the recorder was spawned. Nothing below re-derives any of it. */
   plan: RunnableDictationPlan
-  /** The WAV the recorder wrote. */
-  audioPath: string
-  /** How long the capture was, measured from that WAV by the audio module. */
+  /**
+   * How long the capture was: measured from the WAV by the audio module for a Batch
+   * Dictation, and from spawn to stop for a Live Transcription.
+   */
   durationMs: number
   formattingSettings: FormattingRuntimeSettings
   dictionaryEntries: DictionaryEntry[]
@@ -49,6 +55,19 @@ export interface DictationRunRequest {
    * next Dictation promotes them, and only this pass knows which ones matched.
    */
   onAppliedEntries?: (entries: DictionaryEntry[]) => void
+}
+
+export interface DictationRunRequest extends DictationPipelineRequest {
+  /** The WAV the recorder wrote. */
+  audioPath: string
+}
+
+export interface TranscriptOutcomeRequest extends DictationPipelineRequest {
+  /**
+   * What the Speech Engine said, before any app rewrite: a Batch Dictation's engine result,
+   * or the text a Live Transcription staged.
+   */
+  rawTranscript: string
 }
 
 /**
@@ -84,17 +103,31 @@ export type DictationRunResult = DictationOutcome | FailedTranscription
 export async function runDictation(
   request: DictationRunRequest
 ): Promise<DictationRunResult> {
-  const { plan } = request
-
   const engineResult = await runTranscription(
     transcriptionRequestFromPlan(
-      plan,
+      request.plan,
       request.audioPath,
       engineProcessTimeoutMs(request.durationMs),
       modelManager
     )
   )
   if (engineResult.status === 'failed') return engineResult
+
+  return outcomeFromTranscript({
+    ...request,
+    rawTranscript: engineResult.rawTranscript,
+  })
+}
+
+/**
+ * Everything after the Speech Engine: the brand table, the Dictionary and the Formatting Mode,
+ * in that order. It cannot fail - a Formatting Backend failure degrades to the Raw Transcript
+ * - so it returns an Outcome rather than a Result.
+ */
+export async function outcomeFromTranscript(
+  request: TranscriptOutcomeRequest
+): Promise<DictationOutcome> {
+  const { plan } = request
 
   const outcome = (
     raw: string,
@@ -114,14 +147,14 @@ export async function runDictation(
   // Formatting Backend has nothing to rewrite, and the caller pastes nothing, records nothing
   // and plays no error chime: pressing the shortcut and saying nothing is the normal outcome
   // of pressing the shortcut and saying nothing. See ADR-0006.
-  if (engineResult.rawTranscript.trim() === '') {
+  if (request.rawTranscript.trim() === '') {
     return outcome('', '', false)
   }
 
   // The shipped brand table first, then the user Dictionary. Both are app rewrites of what
   // the Speech Engine said, and both sit above the engine seam so the benchmark scores raw
   // hypotheses.
-  let transcript = fixBrandMishearings(engineResult.rawTranscript)
+  let transcript = fixBrandMishearings(request.rawTranscript)
   if (request.dictionaryEntries.length > 0) {
     const applied = applyDictionary(transcript, request.dictionaryEntries, {
       trackApplied: true,

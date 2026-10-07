@@ -1,6 +1,8 @@
 import { requireRuntimeBinary } from '../../platform/binaries'
-// Parakeet stream mode: spawn the platform Parakeet helper. The helper captures mic,
-// runs the model, and pastes — nothing is read from stdout.
+// Parakeet stream mode: spawn the platform Parakeet helper for a Live Transcription. The
+// helper captures the mic and runs the model; it pastes nothing. It writes NDJSON events to
+// stdout (`parakeet-stream-protocol.ts`), and this module keeps the running transcript from
+// them. Pasting happens once, in `setup-recording.ts`, after the session ends. ADR-0008.
 //
 // Live-mode tracing: set CODICTATE_LIVE_DEBUG=1 in the environment before starting
 // Codictate; stderr lines tagged stream [live][debug] are forwarded below as parakeet stderr.
@@ -11,18 +13,61 @@ import {
   type BlockedDictationPlan,
   type RunnableDictationPlan,
 } from '../../../shared/dictation-plan'
+import {
+  LiveTranscript,
+  parseParakeetStreamEvent,
+} from '../../../shared/parakeet-stream-protocol'
 import { modelManager } from './model-manager'
 import { awaitParakeetWarmup } from './parakeet-warmup'
+import { stderrTail } from './engines/drain-stream'
 import { log } from '../logger'
 import { duckDelayAfterStartChimeMs } from '../sound/play-sound'
 
+/**
+ * How long a stopped helper gets to commit its last segment and exit before it is killed.
+ * The helper's own drain deadline is 3s; this covers that plus process teardown.
+ */
+const STREAM_STOP_DEADLINE_MS = 6_000
+
+/** Stderr lines kept for a failed session's `diagnostic`. */
+const STDERR_TAIL_LINES = 20
+
 export type StreamHandlers = {
-  onStopped: () => void
+  /**
+   * The running transcript changed: committed segments plus the current partial. Called on
+   * every visible change, for the Staging Overlay to draw.
+   */
+  onText?: (text: string) => void
 }
+
+/**
+ * How a Live Transcription session ended, known once the helper has exited and its stdout
+ * has been read to the end.
+ *
+ * `finished` means the helper wrote `final` and exited 0. Anything else is `failed`: a
+ * non-zero exit, a signal, or a zero exit without `final`, because a session that did not say
+ * it ended did not end normally. Both arms carry the staged text, so a failure can still save
+ * the words to History.
+ */
+export type StreamSessionEnd =
+  | { status: 'finished'; text: string }
+  | {
+      status: 'failed'
+      text: string
+      exitCode: number | null
+      /** Helper stderr tail, for the log. Never shown to the user. */
+      diagnostic?: string
+    }
 
 export type StreamSession = {
   proc: ReturnType<typeof Bun.spawn>
   streamDebugId?: number
+  /** When the helper was spawned, for the Dictation Outcome's `durationMs`. */
+  startedAtMs: number
+  /** The running transcript right now. */
+  text: () => string
+  /** Resolves once, after the helper has exited and its stdout is fully read. */
+  ended: Promise<StreamSessionEnd>
 }
 
 export type ParakeetStreamStartOptions = {
@@ -80,6 +125,31 @@ function checkParakeetStreamRuntimeReady(
   return null
 }
 
+/**
+ * Read a pipe line by line until it closes. Lines are trimmed and empty ones dropped.
+ */
+async function readLines(
+  stream: ReadableStream<Uint8Array>,
+  onLine: (line: string) => void
+): Promise<void> {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buf = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    const lines = buf.split('\n')
+    buf = lines.pop() ?? ''
+    for (const line of lines) {
+      const t = line.trim()
+      if (t) onLine(t)
+    }
+  }
+  const rest = (buf + decoder.decode()).trim()
+  if (rest) onLine(rest)
+}
+
 export async function startParakeetStream(
   /** The run to start. The Speech Model comes from here, not from a constant in this file. */
   plan: RunnableDictationPlan,
@@ -113,24 +183,30 @@ export async function startParakeetStream(
     Math.min(100, Math.round(options?.outputDuckLevel ?? 0))
   )
 
-  log('stream', 'spawning Parakeet helper (helper handles capture + paste)', {
-    binary,
-    streamArgs: args.slice(1),
-    streamTranscriptionMode,
-    speechModelId: plan.speechModelId,
-    modelDir,
-    deviceRef: options?.deviceRef,
-    streamDebugId,
-    outputDuckDelayMs,
-    outputDuckBuiltIn,
-    outputDuckHeadphones,
-    outputDuckLevel,
-  })
+  log(
+    'stream',
+    'spawning Parakeet helper (helper streams events, Bun pastes)',
+    {
+      binary,
+      streamArgs: args.slice(1),
+      streamTranscriptionMode,
+      speechModelId: plan.speechModelId,
+      modelDir,
+      deviceRef: options?.deviceRef,
+      streamDebugId,
+      outputDuckDelayMs,
+      outputDuckBuiltIn,
+      outputDuckHeadphones,
+      outputDuckLevel,
+    }
+  )
 
   const proc = Bun.spawn(args, {
-    stdout: 'ignore',
+    stdout: 'pipe',
     stderr: 'pipe',
-    stdin: 'ignore',
+    // The stop channel on both platforms: `stop` on stdin, or stdin closing. A Windows process
+    // cannot be signalled gracefully, and stdin closing also stops a helper whose host died.
+    stdin: 'pipe',
     env: {
       ...process.env,
       LC_ALL: 'en_US.UTF-8',
@@ -144,47 +220,120 @@ export async function startParakeetStream(
         : {}),
     },
   })
+  const startedAtMs = Date.now()
 
   log('stream', 'spawned Parakeet stream process', {
     pid: proc.pid,
     streamDebugId,
   })
 
-  void (async () => {
-    try {
-      const reader = proc.stderr.getReader()
-      const decoder = new TextDecoder('utf-8')
-      let buf = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() ?? ''
-        for (const line of lines) {
-          const t = line.trim()
-          if (t) log('stream', 'parakeet stderr', { text: t.slice(0, 500) })
-        }
-      }
-    } catch (err) {
-      log('stream', 'parakeet stderr read error', { err: String(err) })
+  const transcript = new LiveTranscript()
+  let sawFinal = false
+
+  const stdoutDone = readLines(proc.stdout, (line) => {
+    const event = parseParakeetStreamEvent(line)
+    if (event === null) {
+      log('stream', 'parakeet stdout line is not a stream event', {
+        text: line.slice(0, 200),
+        streamDebugId,
+      })
+      return
+    }
+    if (event.kind === 'final') {
+      sawFinal = true
+      return
+    }
+    if (transcript.apply(event)) {
+      const text = transcript.text()
+      log('stream', 'live transcript', {
+        event: event.kind,
+        chars: text.length,
+        text: text.slice(-200),
+        streamDebugId,
+      })
+      handlers.onText?.(text)
+    }
+  }).catch((err) => {
+    log('stream', 'parakeet stdout read error', { err: String(err) })
+  })
+
+  const stderrLines: string[] = []
+  const stderrDone = readLines(proc.stderr, (line) => {
+    stderrLines.push(line)
+    if (stderrLines.length > STDERR_TAIL_LINES) stderrLines.shift()
+    log('stream', 'parakeet stderr', { text: line.slice(0, 500) })
+  }).catch((err) => {
+    log('stream', 'parakeet stderr read error', { err: String(err) })
+  })
+
+  const ended = (async (): Promise<StreamSessionEnd> => {
+    await proc.exited
+    await Promise.all([stdoutDone, stderrDone])
+    const text = transcript.finalText()
+    log('stream', 'parakeet stream process exited', {
+      exitCode: proc.exitCode,
+      signalCode: proc.signalCode,
+      sawFinal,
+      chars: text.length,
+      streamDebugId,
+    })
+    if (proc.exitCode === 0 && sawFinal) return { status: 'finished', text }
+    const diagnostic = stderrTail(stderrLines.join('\n'))
+    return {
+      status: 'failed',
+      text,
+      exitCode: proc.exitCode,
+      ...(diagnostic ? { diagnostic } : {}),
     }
   })()
 
-  void proc.exited.then(() => {
-    log('stream', 'parakeet stream process exited', {
-      exitCode: proc.exitCode,
+  return {
+    status: 'started',
+    session: {
+      proc,
       streamDebugId,
-    })
-    handlers.onStopped()
-  })
-
-  return { status: 'started', session: { proc, streamDebugId } }
+      startedAtMs,
+      text: () => transcript.text(),
+      ended,
+    },
+  }
 }
 
+/**
+ * Ask the helper to end the session and wait for it to exit.
+ *
+ * The helper commits the segment in progress and writes `final` before it exits, so this
+ * waits for that rather than killing it. Only a helper that misses the deadline is killed,
+ * and `session.ended` then reports it as failed.
+ */
 export async function stopParakeetStream(
   session: StreamSession
-): Promise<void> {
-  session.proc.kill('SIGINT')
-  await session.proc.exited
+): Promise<StreamSessionEnd> {
+  const stdin = session.proc.stdin
+  if (stdin && typeof stdin !== 'number') {
+    try {
+      stdin.write('stop\n')
+      void stdin.flush()
+      void stdin.end()
+    } catch {
+      // Already exited: the pipe is closed and `ended` already knows how it went.
+    }
+  }
+  const deadline = Symbol('deadline')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const settled = await Promise.race([
+    session.proc.exited,
+    new Promise<typeof deadline>((resolve) => {
+      timer = setTimeout(() => resolve(deadline), STREAM_STOP_DEADLINE_MS)
+    }),
+  ])
+  clearTimeout(timer)
+  if (settled === deadline) {
+    log('stream', 'parakeet helper missed the stop deadline, killing it', {
+      streamDebugId: session.streamDebugId,
+      deadlineMs: STREAM_STOP_DEADLINE_MS,
+    })
+    session.proc.kill('SIGKILL')
+  }
+  return session.ended
 }
