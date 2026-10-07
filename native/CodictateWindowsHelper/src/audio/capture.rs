@@ -105,7 +105,8 @@ fn finish_recording_worker(
         .map_err(|_| "sample worker panicked".to_string())?
 }
 
-fn spawn_stdin_stop_thread(stop_flag: Arc<AtomicBool>) -> JoinHandle<()> {
+/// Sets `stop_flag` on a `stop` line or when stdin closes. Shared by `record` and `stream`.
+pub(crate) fn spawn_stdin_stop_thread(stop_flag: Arc<AtomicBool>) -> JoinHandle<()> {
     thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
