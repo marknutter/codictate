@@ -43,6 +43,7 @@ import {
   setFormattingSlackTone,
   setFormattingSlackUseMarkdown,
   setS1FormattingControls,
+  setSelfCorrectionCleanup,
 } from "../../../rpc";
 import { appEvents } from "../../../app-events";
 import { settingsHelperClass } from "../settings-shared";
@@ -426,6 +427,9 @@ export function SectionFormatting({ settings }: Props) {
           ? { forceModeId: patch.forceModeId }
           : {}),
         ...(patch.s1 ? { s1: { ...old.formatting.s1, ...patch.s1 } } : {}),
+        ...(patch.selfCorrectionCleanup !== undefined
+          ? { selfCorrectionCleanup: patch.selfCorrectionCleanup }
+          : {}),
         ...(patch.enabledModes
           ? {
               enabledModes: {
@@ -457,6 +461,18 @@ export function SectionFormatting({ settings }: Props) {
     onMutate: (enabled: boolean) => {
       queryClient.setQueryData(["settings"], (old: AppSettings | undefined) =>
         old ? mergeFormatting(old, { enabled }) : old,
+      );
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["settings"] }),
+  });
+
+  // The main process decides whether this can run and refuses a write that would turn it on
+  // when it cannot; a refused write re-fetches so the switch snaps back (ADR-0005).
+  const selfCorrectionCleanupToggle = useMutation({
+    mutationFn: setSelfCorrectionCleanup,
+    onMutate: (selfCorrectionCleanup: boolean) => {
+      queryClient.setQueryData(["settings"], (old: AppSettings | undefined) =>
+        old ? mergeFormatting(old, { selfCorrectionCleanup }) : old,
       );
     },
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["settings"] }),
@@ -944,6 +960,15 @@ export function SectionFormatting({ settings }: Props) {
         </div>
       )}
 
+      <SelfCorrectionCleanupSetting
+        checked={formatting.selfCorrectionCleanup}
+        readiness={settings.selfCorrectionCleanupReadiness}
+        pending={selfCorrectionCleanupToggle.isPending}
+        onCheckedChange={(enabled) =>
+          selfCorrectionCleanupToggle.mutate(enabled)
+        }
+      />
+
       {/* Modes accordion */}
       <div className="mb-8">
         <h2 className="text-[14px] text-overlay/48 font-medium uppercase tracking-wider mb-3">
@@ -1107,6 +1132,63 @@ export function SectionFormatting({ settings }: Props) {
         </div>
       </div>
     </>
+  );
+}
+
+/**
+ * "Clean up self-corrections". Its own setting rather than a Formatting Mode: it changes what
+ * the text says where the speaker corrected themselves, not how the text reads, and it runs
+ * whether or not Auto-polish is on. Availability and the sentence under the switch come from
+ * the main process as `selfCorrectionCleanupReadiness`; nothing here derives either.
+ */
+function SelfCorrectionCleanupSetting({
+  checked,
+  readiness,
+  pending,
+  onCheckedChange,
+}: {
+  checked: boolean;
+  readiness: AppSettings["selfCorrectionCleanupReadiness"];
+  pending: boolean;
+  onCheckedChange: (checked: boolean) => void;
+}) {
+  // Turning it off is always allowed; turning it on only when it can run.
+  const disabled = pending || (!readiness.ready && !checked);
+  return (
+    <div className="mb-8">
+      <h2 className="text-[14px] text-overlay/48 font-medium uppercase tracking-wider mb-3">
+        Corrections
+      </h2>
+      <div
+        className={`rounded-xl border border-overlay/11 bg-surface-1 ${
+          !readiness.ready ? "opacity-65" : ""
+        }`}
+      >
+        <div className="flex items-center gap-3 px-4 py-3">
+          <div className="flex-1 min-w-0">
+            <span
+              className={`block text-[15px] font-medium ${checked ? "text-overlay/78" : "text-overlay/58"}`}
+            >
+              Clean up self-corrections
+            </span>
+            <span className="mt-0.5 block text-[12px] text-overlay/40 leading-snug">
+              {readiness.message}
+            </span>
+          </div>
+          <Switch
+            checked={checked}
+            onCheckedChange={onCheckedChange}
+            disabled={disabled}
+            aria-label="Toggle clean up self-corrections"
+          />
+        </div>
+      </div>
+      <p className={settingsHelperClass}>
+        Runs after your dictionary and before Auto-polish, so "send it to John,
+        I mean Jane" is pasted as "send it to Jane". If the model fails, your
+        dictation is pasted as spoken.
+      </p>
+    </div>
   );
 }
 
