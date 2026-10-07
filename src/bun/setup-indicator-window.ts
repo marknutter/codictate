@@ -4,6 +4,7 @@ import type {
   AppStatus,
   RecordingIndicatorMode,
 } from '../shared/types'
+import { indicatorShouldBeVisible } from './utils/window/indicator-state'
 import {
   createNativeIndicatorHelper,
   type NativeIndicatorHelper,
@@ -35,16 +36,6 @@ function readIndicatorPlan(
   const wantLifecycle =
     mode !== 'off' && (settings.onboardingCompleted || previewMode !== null)
   return { mode, wantLifecycle }
-}
-
-/** Actually visible on screen (not parked off-screen). */
-function indicatorShouldBeVisible(
-  mode: RecordingIndicatorMode,
-  status: AppStatus
-): boolean {
-  if (mode === 'off') return false
-  if (mode === 'always') return true
-  return status === 'recording' || status === 'transcribing'
 }
 
 function bottomCenterFrame(display?: Display): {
