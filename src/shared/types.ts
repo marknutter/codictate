@@ -3,6 +3,7 @@ import { RPCSchema } from 'electrobun'
 import type { PlatformCapabilities } from './platform'
 import type { BlockedDictationPlan, DictationReadiness } from './dictation-plan'
 import type { SettingsHealAnnouncement } from './settings-heal'
+import type { SelfCorrectionCleanupReadiness } from './self-correction-cleanup'
 import type {
   FormattingModeId,
   FormattingEmailGreetingStyle,
@@ -82,6 +83,13 @@ export interface FormattingSettings {
   modelAvailability: Record<FormatterModelTier, boolean>
   /** General S1-mini controls. Matching enabled app presets may refine these per Dictation. */
   s1: S1FormattingSettings
+  /**
+   * "Clean up self-corrections": resolve spoken self-corrections with the selected
+   * Formatting Model after the Dictionary and before the Formatting Mode. Independent of the
+   * Auto-polish master switch. Kept runnable by the heal pass (ADR-0005); its readiness ships
+   * as `AppSettings.selfCorrectionCleanupReadiness`.
+   */
+  selfCorrectionCleanup: boolean
   email: FormattingEmailSettings
   imessage: FormattingImessageSettings
   slack: FormattingSlackSettings
@@ -149,6 +157,8 @@ export interface FormattingRuntimeSettings {
   userDisplayName: string
   formatterModelTier: FormatterModelTier
   s1: S1FormattingSettings
+  /** Run Self-correction Cleanup before the Formatting Mode. */
+  selfCorrectionCleanup: boolean
   email: FormattingEmailSettings
   imessage: FormattingImessageSettings
   slack: FormattingSlackSettings
@@ -269,6 +279,13 @@ export interface AppSettings {
    */
   dictationReadiness: DictationReadiness
   /**
+   * Whether "Clean up self-corrections" can run right now, with the sentence to show when it
+   * cannot. Decided in the main process from the selected Formatting Model and the on-disk
+   * weights (see src/shared/self-correction-cleanup.ts); the window renders it and derives
+   * nothing from `formatting.modelAvailability`.
+   */
+  selfCorrectionCleanupReadiness: SelfCorrectionCleanupReadiness
+  /**
    * The last Dictation that refused to start, or `null`. Reached only when the world changed
    * behind the app's back - weights deleted in Finder, a failed disk, a cloud-storage
    * eviction - because the settings themselves are kept runnable. Rides this payload so the
@@ -364,6 +381,7 @@ export interface FormattingSettingsPatch {
   forceModeId?: FormattingModeId | null
   formatterModelTier?: FormatterModelTier
   s1?: Partial<S1FormattingSettings>
+  selfCorrectionCleanup?: boolean
   email?: Partial<FormattingEmailSettings>
   imessage?: Partial<FormattingImessageSettings>
   slack?: Partial<FormattingSlackSettings>

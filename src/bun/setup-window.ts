@@ -479,8 +479,12 @@ export function setupWindow(deps: WindowDeps): WindowHandle {
                   error,
                 })
                 if (done && !error) {
-                  deps.appConfig.refreshFormatterModelInstalled()
-                  rpc.send.updateSettings(deps.appConfig.getSettings())
+                  void deps.appConfig
+                    .refreshFormatterModelInstalled()
+                    .then(() =>
+                      rpc.send.updateSettings(deps.appConfig.getSettings())
+                    )
+                    .catch(console.error)
                 }
               } catch {
                 // Window may be closed during a long download
@@ -494,8 +498,14 @@ export function setupWindow(deps: WindowDeps): WindowHandle {
         deleteFormatterModel: ({ tier }) => {
           const deleted = formatterModelManager.delete(tier)
           if (deleted) {
-            deps.appConfig.refreshFormatterModelInstalled()
-            rpc.send.updateSettings(deps.appConfig.getSettings())
+            // Removing weights is never refused, so a setting that needed them is healed off
+            // and announced before the window hears about it (ADR-0005).
+            void deps.appConfig
+              .refreshFormatterModelInstalled()
+              .then(() => {
+                rpc.send.updateSettings(deps.appConfig.getSettings())
+              })
+              .catch(console.error)
           }
         },
         openExternalUrl: ({ url }) => {

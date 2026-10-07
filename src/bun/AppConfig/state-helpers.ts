@@ -105,6 +105,12 @@ export function formattingSettingsAfterPatch(
   ) {
     return null
   }
+  if (
+    patch.selfCorrectionCleanup !== undefined &&
+    typeof patch.selfCorrectionCleanup !== 'boolean'
+  ) {
+    return null
+  }
 
   const next: FormattingSettings = {
     ...current,
@@ -133,6 +139,9 @@ export function formattingSettingsAfterPatch(
     next.formatterModelTier = patch.formatterModelTier
   }
   if (patch.s1 !== undefined) next.s1 = { ...next.s1, ...patch.s1 }
+  if (patch.selfCorrectionCleanup !== undefined) {
+    next.selfCorrectionCleanup = patch.selfCorrectionCleanup
+  }
   if (patch.email !== undefined) next.email = { ...next.email, ...patch.email }
   if (patch.imessage !== undefined) {
     next.imessage = { ...next.imessage, ...patch.imessage }
