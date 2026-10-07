@@ -1,4 +1,4 @@
-use crate::audio::capture::{open_input_sample_stream, spawn_stdin_stop_thread};
+use crate::audio::capture::{InputSampleStream, open_input_sample_stream, spawn_stdin_stop_thread};
 use crate::audio::resample::{RECORDING_SAMPLE_RATE, StreamingResampler};
 use crate::ipc::emit_json;
 use parakeet_rs::{ExecutionConfig, ExecutionProvider, ParakeetTDT, TimestampMode, Transcriber};
@@ -442,7 +442,13 @@ fn run_vad_stream(
         })?;
     }
 
-    drop(input);
+    // Audio still queued behind the last pass is the end of what the user said before the
+    // stop. It only extends the utterance in progress; no transcription runs on it here.
+    drain_after_stop(input, &mut resampler, |chunk| {
+        if in_speech {
+            utterance.extend_from_slice(chunk);
+        }
+    })?;
     // Stopped mid-utterance: the speech never reached its silence commit, and with push-to-talk
     // that is the usual case for the last thing said.
     if in_speech
@@ -565,13 +571,49 @@ fn run_live_stream(
         })?;
     }
 
-    drop(input);
+    // Same as the vad loop: queued audio extends the segment in progress, and no partial pass
+    // runs on it - nobody would see one, and the stop commit below transcribes all of it.
+    drain_after_stop(input, &mut resampler, |chunk| {
+        if in_speech {
+            utterance.extend_from_slice(chunk);
+        }
+    })?;
     // Stopped mid-segment, which with push-to-talk is how the last segment always ends.
     if in_speech && (utterance.len() >= MIN_UTTERANCE || !last_partial_text.is_empty()) {
         log_phase("stream [live]: stop commit");
         commit_live_utterance(&mut model, &mut events, &utterance, &last_partial_text)?;
     }
     events.finish()
+}
+
+/// Stops capture, then feeds every chunk still queued in the input channel - and the
+/// resampler's own tail - to `on_chunk` at the recording rate. Without this a stop dropped
+/// whatever the capture thread had queued while the loop was busy in a transcription pass,
+/// which is the last words before a push-to-talk release. The macOS helper delivers its queued
+/// chunks the same way before its loop ends.
+fn drain_after_stop(
+    input: InputSampleStream,
+    resampler: &mut StreamingResampler,
+    mut on_chunk: impl FnMut(&[f32]),
+) -> Result<(), String> {
+    let queued = input.stop_and_drain();
+    let queued_samples: usize = queued.iter().map(Vec::len).sum();
+    for input_chunk in &queued {
+        resampler.process(input_chunk, |chunk| {
+            on_chunk(chunk);
+            Ok(())
+        })?;
+    }
+    resampler.finish(|chunk| {
+        on_chunk(chunk);
+        Ok(())
+    })?;
+    log_phase(format!(
+        "stream: drained {} queued chunks ({} input samples) after stop",
+        queued.len(),
+        queued_samples
+    ));
+    Ok(())
 }
 
 /// The segment's final pass, written as a `commit`. Falls back to the last partial when the
