@@ -855,3 +855,22 @@ describe('buildDictationPlan agrees with getDictationReadiness', () => {
     }
   })
 })
+
+describe('blockedDictationPlan - microphone_missing', () => {
+  for (const mode of ['batch', 'live'] as const) {
+    test(`${mode}: blocked with a reconnect-or-choose-another message`, () => {
+      const plan = blockedDictationPlan(
+        mode,
+        'microphone_missing',
+        'parakeet-tdt-0.6b-v3'
+      )
+      expect(plan.status).toBe('blocked')
+      expect(plan.mode).toBe(mode)
+      expect(plan.reason).toBe('microphone_missing')
+      expect(typeof plan.message).toBe('string')
+      expect(plan.message.length).toBeGreaterThan(0)
+      expect(plan.message.toLowerCase()).toContain('microphone')
+      expect(plan.message.toLowerCase()).toContain('reconnect')
+    })
+  }
+})

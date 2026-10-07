@@ -12,7 +12,7 @@ private enum StreamSessionLog {
   nonisolated(unsafe) static var stderrTag: String = ""
 }
 
-private func logPhase(_ msg: String) {
+func logPhase(_ msg: String) {
   let tag = StreamSessionLog.stderrTag
   let line =
     tag.isEmpty
@@ -52,7 +52,7 @@ private func usage() -> Never {
     Usage:
       CodictateParakeetHelper transcribe <wavPath> <parakeetModelDir>
       CodictateParakeetHelper transcribe-session <parakeetModelDir>
-      CodictateParakeetHelper stream <vad|live> <parakeetModelDir>
+      CodictateParakeetHelper stream <vad|live> <parakeetModelDir> [inputDeviceIndex]
     """
   FileHandle.standardError.write(Data(msg.utf8))
   FileHandle.standardError.write(Data([0x0a]))
@@ -493,6 +493,7 @@ struct CodictateParakeetHelperMain {
     guard args.count >= 2 else { usage() }
     let mode = args[0]
     let modelDir = URL(fileURLWithPath: args[1], isDirectory: true)
+    let deviceIndex = try InputDevice.parseIndex(args.count >= 3 ? args[2] : nil)
 
     if let sid = ProcessInfo.processInfo.environment["CODICTATE_STREAM_DEBUG_ID"]?
       .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -524,19 +525,20 @@ struct CodictateParakeetHelperMain {
     }
 
     if mode == "vad" {
-      try await runVadMode(models: models)
+      try await runVadMode(models: models, deviceIndex: deviceIndex)
     } else {
-      try await runLiveMode(models: models)
+      try await runLiveMode(models: models, deviceIndex: deviceIndex)
     }
   }
 
   // MARK: VAD mode
 
-  static func runVadMode(models: AsrModels) async throws {
+  static func runVadMode(models: AsrModels, deviceIndex: Int?) async throws {
     let asr = AsrManager(config: .default)
     try await asr.loadModels(models)
 
     let engine = AVAudioEngine()
+    if let deviceIndex { try InputDevice.select(index: deviceIndex, on: engine) }
     let inputNode = engine.inputNode
     let hwFormat = inputNode.outputFormat(forBus: 0)
 
@@ -615,10 +617,11 @@ struct CodictateParakeetHelperMain {
 
   // MARK: Live mode
 
-  static func runLiveMode(models: AsrModels) async throws {
+  static func runLiveMode(models: AsrModels, deviceIndex: Int?) async throws {
     let asr = AsrManager(config: .default)
     try await asr.loadModels(models)
     let engine = AVAudioEngine()
+    if let deviceIndex { try InputDevice.select(index: deviceIndex, on: engine) }
     let inputNode = engine.inputNode
     let hwFormat = inputNode.outputFormat(forBus: 0)
 

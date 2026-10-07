@@ -21,11 +21,12 @@ import {
   stopParakeetStream,
   type StreamSession,
 } from './utils/whisper/parakeet-stream-runner'
-import type {
-  BlockedDictationPlan,
-  DictationMode,
-  DictationPlan,
-  RunnableDictationPlan,
+import {
+  blockedDictationPlan,
+  type BlockedDictationPlan,
+  type DictationMode,
+  type DictationPlan,
+  type RunnableDictationPlan,
 } from '../shared/dictation-plan'
 import {
   finishObservedCorrection,
@@ -42,6 +43,10 @@ import {
 import { AppConfig } from './AppConfig/AppConfig'
 import type { TrayHandlers } from './setup-tray'
 import { findDevices, type AudioDeviceSnapshot } from './utils/audio/devices'
+import {
+  resolveInputDevice,
+  type ResolvedInputDevice,
+} from './utils/audio/resolve-input-device'
 import { DICTATION_HOLD_QUALIFY_MS } from '../shared/dictation-shortcut'
 import type { AppStatus, ShortcutId } from '../shared/types'
 import { runDictation, type DictationOutcome } from './dictation/run-dictation'
@@ -134,38 +139,34 @@ export const setupRecording = (
   /** Monotonic id for log correlation with Parakeet helper stderr (`[sN]`). */
   let streamDebugSeq = 0
 
-  const resolveStreamDeviceRef = async (): Promise<string | undefined> => {
-    if (getPlatformRuntime() !== 'windows') return undefined
-
-    let currentSnapshot = getAudioDevices?.() ?? { devices: {}, details: {} }
-    if (Object.keys(currentSnapshot.devices).length === 0) {
-      currentSnapshot = await findDevices()
+  /**
+   * The microphone this Dictation records from, for both paths. A cached snapshot that says
+   * the chosen microphone is missing is re-read once before blocking, because the snapshot only
+   * refreshes on an interval and a microphone plugged in seconds ago must not be refused.
+   */
+  const resolveDictationDevice = async (): Promise<ResolvedInputDevice> => {
+    const selection = appConfig.getInputDeviceSelection()
+    let snapshot = getAudioDevices?.() ?? { devices: {}, details: {} }
+    let resolved = resolveInputDevice(selection, snapshot)
+    if (resolved.status === 'missing') {
+      snapshot = await findDevices()
+      resolved = resolveInputDevice(selection, snapshot)
     }
-
-    const currentDevices = currentSnapshot.devices
-    const currentDeviceDetails = currentSnapshot.details
-    const resolved = appConfig.resolveAudioDevice(
-      currentDevices,
-      currentDeviceDetails
-    )
-    const deviceExists = resolved.toString() in currentDevices
-    const device = deviceExists
-      ? resolved
-      : Number(Object.keys(currentDevices)[0] ?? '0')
-    const deviceLabel = currentDevices[device.toString()]?.trim() || 'default'
-    const deviceId = currentDeviceDetails[device.toString()]?.id ?? null
-    const deviceRef = deviceId ?? String(device)
-
-    log('stream', 'resolved stream audio device', {
-      index: device,
-      name: deviceLabel,
-      requestedIndex: resolved,
-      endpointId: deviceId ?? undefined,
-      deviceRef,
-      deviceExists,
+    log('mic', 'resolved dictation device', {
+      selection,
+      ...resolved,
     })
+    return resolved
+  }
 
-    return deviceRef
+  /** The chosen microphone is gone: block with a reason rather than record from another one. */
+  const reportMissingMicrophone = async (plan: RunnableDictationPlan) => {
+    resetHoldGate()
+    setTrayIdle()
+    onStatusChange?.('ready')
+    await reportBlockedDictation(
+      blockedDictationPlan(plan.mode, 'microphone_missing', plan.speechModelId)
+    )
   }
 
   let holdArmTimer: ReturnType<typeof setTimeout> | null = null
@@ -485,7 +486,12 @@ export const setupRecording = (
     const streamDebugId = ++streamDebugSeq
     activeStreamShortcutMode = shortcutMode
     try {
-      const streamDeviceRef = await resolveStreamDeviceRef()
+      const device = await resolveDictationDevice()
+      if (device.status === 'missing') {
+        await reportMissingMicrophone(plan)
+        return
+      }
+      const streamDeviceRef = device.deviceRef
       log('stream', 'starting Parakeet stream session', {
         streamTranscriptionMode: appConfig.getStreamTranscriptionMode(),
         speechModelId: plan.speechModelId,
@@ -611,6 +617,11 @@ export const setupRecording = (
         planMode: plan.mode,
         speechModelId: plan.speechModelId,
       })
+      const device = await resolveDictationDevice()
+      if (device.status === 'missing') {
+        await reportMissingMicrophone(plan)
+        return
+      }
       if (appConfig.getSoundEffectsEnabled())
         playStartSound(appConfig.getFunModeEnabled())
       setTrayRecording()
@@ -621,7 +632,7 @@ export const setupRecording = (
         plan,
         recordingSession,
         (capture) => handleCaptureFinished(plan, capture),
-        getAudioDevices
+        device.deviceRef
       )
 
       if (pendingHoldReleaseWhileStarting && recordingSession && recorderProc) {
