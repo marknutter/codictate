@@ -55,6 +55,19 @@ function commonPrefixLength(a: string, b: string): number {
 }
 
 /**
+ * `index` moved back so it does not split a word: a word is either all committed or all
+ * partial. The Windows overlay draws the committed text over the whole text with the same
+ * word wrap, which only lines up when the committed part ends at a word boundary.
+ */
+function wordBoundaryAtOrBefore(text: string, index: number): number {
+  if (index <= 0 || index >= text.length) return index
+  if (/\s/.test(text[index]) || /\s/.test(text[index - 1])) return index
+  const before = text.slice(0, index)
+  const lastSpace = before.search(/\s\S*$/)
+  return lastSpace < 0 ? 0 : lastSpace
+}
+
+/**
  * Where the tail that fits starts: the first word that begins inside the last `maxChars`
  * characters. A transcript whose tail is one unbroken run of characters is cut mid-run,
  * because there is no word boundary to cut at.
@@ -80,7 +93,8 @@ function tailStart(text: string, maxChars: number): number {
  * 3. The committed/partial split is the longest common prefix of the shaped whole text and
  *    the shaped committed text. A Scratch Command spoken in the partial can remove committed
  *    words, so the shaped committed text is not always a prefix of the shaped whole; the
- *    common prefix is what both agree on.
+ *    common prefix is what both agree on. A split that would land inside a word moves back
+ *    to the start of that word, so the whole word is partial.
  * 4. Only the tail that fits is kept: at most `maxChars` characters, cut at a word boundary,
  *    with `…` in front when anything was cut. The `…` belongs to whichever part the first
  *    kept character belongs to.
@@ -97,7 +111,10 @@ export function shapeStagingOverlayText(
   const whole = scratch(update.text).trim()
   if (whole === '') return EMPTY_STAGING_OVERLAY_TEXT
   const committedWhole = scratch(update.committedText).trim()
-  const committedLength = commonPrefixLength(whole, committedWhole)
+  const committedLength = wordBoundaryAtOrBefore(
+    whole,
+    commonPrefixLength(whole, committedWhole)
+  )
 
   const start = tailStart(whole, Math.max(1, maxChars))
   const prefix = start > 0 ? STAGING_OVERLAY_ELLIPSIS : ''
