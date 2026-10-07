@@ -27,8 +27,6 @@ let package = Package(
         .unsafeFlags(["-LVendor/lib"]),
         .linkedFramework("AVFoundation"),
         .linkedFramework("CoreAudio"),
-        .linkedFramework("AppKit"),
-        .linkedFramework("ApplicationServices"),
       ]
     ),
   ]

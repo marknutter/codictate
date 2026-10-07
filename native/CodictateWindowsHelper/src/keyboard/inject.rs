@@ -2,7 +2,7 @@ use std::thread;
 use std::time::Duration;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_BACK, VK_CONTROL,
-    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SPACE,
+    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT,
 };
 
 fn keyboard_input(vk: u16, key_up: bool) -> INPUT {
@@ -97,10 +97,6 @@ pub fn send_ctrl_v() -> bool {
     let ctrl_up = send_key_up_safely(VK_CONTROL);
 
     sent && v_up && left_ctrl_up && right_ctrl_up && ctrl_up
-}
-
-pub fn send_space() -> bool {
-    release_modifiers_for_text_injection() && send_key_press(VK_SPACE)
 }
 
 pub fn send_backspaces(count: usize) -> bool {

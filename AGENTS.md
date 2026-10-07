@@ -56,7 +56,7 @@ src/
   bun/                          # Main process (Bun + Electrobun)
     index.ts                    # Entry point
     AppConfig/                  # Persistent app configuration
-    dictation/                  # The Batch Dictation pipeline (transcript -> Dictation Outcome)
+    dictation/                  # The Dictation pipeline (audio or staged transcript -> Dictation Outcome)
     platform/                   # Platform-specific code
       macos/                    #   macOS implementations
       windows/                  #   Windows implementations
@@ -93,6 +93,7 @@ src/
     settings-heal.ts            # Whole-object validation + the heal pass (pure, no platform)
     formatting-modes.ts         # Formatting mode definitions
     dictation-shortcut.ts       # Shortcut config types
+    parakeet-stream-protocol.ts # Live Transcription NDJSON events + running transcript (pure)
     shortcut-options.ts         # Available shortcut options
     recording-duration-presets.ts
     transcription-languages.ts
@@ -169,6 +170,16 @@ A Dictation never adapts to an unrunnable state; the state is kept runnable inst
 - The benchmark is outside all of this: no settings, no availability healing, no fallback semantics. It reuses the ASR Harness command builder, not the plan. Outside the plan does not mean frozen - `benchmarks/stt/runner.ts` is fixed like any other module - but do not give it a Dictation Plan, a settings read or a fallback.
 
 See `docs/adr/0005-no-runtime-fallbacks-for-dictation.md`.
+
+### Live Transcription
+
+Live Transcription inserts nothing while the user speaks and pastes once when the Dictation ends (`docs/adr/0008-live-transcription-stages-in-an-overlay.md`).
+
+- **The helpers report, Bun pastes.** `CodictateParakeetHelper stream` (macOS) and `CodictateWindowsHelper stream` (Windows) perform no clipboard or synthetic-key injection. They write NDJSON events to stdout - `partial` (the segment in progress, replacing the last partial), `commit` (a finished segment) and `final` (the session ended normally) - and keep logs on stderr. The contract is `src/shared/parakeet-stream-protocol.ts`, which also holds `LiveTranscript`, the pure accumulator of committed segments plus the current partial. Do not add a paste back into either helper.
+- **The Staging Overlay shows it.** The recording indicator grows into a text panel while the status is `streaming`: `setup-recording.ts` reports each running-transcript change with the plan's Transcription Language, `shapeStagingOverlayText` (`src/bun/utils/window/staging-overlay-text.ts`, pure) applies the Scratch Command by the same rule the paste does and splits committed from partial, and the indicator sends a throttled `text` command to the native helper. Any other status collapses it; indicator mode Off hides it. The panel never takes focus. See `docs/RECORDING_INDICATOR.md`.
+- **Stopping is graceful on both platforms.** `stopParakeetStream` writes `stop` to the helper's stdin and closes it; the helper transcribes the segment in progress, commits it, writes `final` and exits 0. SIGINT and SIGTERM do the same on macOS. A stop before the audio loop is running (during the model load) writes `final` and exits at once, and once it runs both helpers bound the last pass with a 3s drain deadline of their own. Escape and an app-initiated stop write `cancel` instead (`streamStopCommandFor`): the helper commits its last partial, writes `final` and exits with no final pass, and the status stays `transcribing` until it has, so a press in that window is never refused while the app claims to be ready. A helper that misses the 6s stop deadline is killed, and that session is a failure.
+- **One pipeline.** The staged text enters the Dictation pipeline after the Speech Engine, through `outcomeFromTranscript` in `src/bun/dictation/run-dictation.ts` - the same brand table, Dictionary and Formatting Mode a Batch Dictation gets - and `setup-recording.ts` pastes the resulting Dictation Outcome and writes History and stats through the same function the Batch path uses. `engineId` and `languageId` come from the plan the stream was started with.
+- **How it ends decides what happens to the text.** A normal stop pastes. Escape pastes nothing and records nothing. A stop the app initiates (quit, a settings change, Live Transcription switched off) pastes nothing but keeps the staged text in History. A helper that exits without `final` is a failed Dictation (`live_transcription_interrupted`): the four failure surfaces, nothing pasted, the staged text saved to History. An empty transcript pastes and records nothing.
 
 ### Formatting pipeline
 

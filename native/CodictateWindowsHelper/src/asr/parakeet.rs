@@ -1,14 +1,14 @@
-use crate::audio::capture::open_input_sample_stream;
+use crate::audio::capture::{InputSampleStream, open_input_sample_stream};
 use crate::audio::resample::{RECORDING_SAMPLE_RATE, StreamingResampler};
 use crate::ipc::emit_json;
-use crate::keyboard::inject;
-use arboard::Clipboard;
 use parakeet_rs::{ExecutionConfig, ExecutionProvider, ParakeetTDT, TimestampMode, Transcriber};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -39,59 +39,264 @@ struct SessionFinalTranscriptMessage {
     text: String,
 }
 
-struct TextInjector {
-    clipboard: Clipboard,
+#[derive(Serialize)]
+struct StreamTextEvent<'a> {
+    kind: &'static str,
+    text: &'a str,
 }
 
-impl TextInjector {
-    fn new() -> Result<Self, String> {
-        let clipboard = Clipboard::new().map_err(|err| format!("clipboard init failed: {err}"))?;
-        Ok(Self { clipboard })
+#[derive(Serialize)]
+struct StreamFinalEvent {
+    kind: &'static str,
+}
+
+/// Live Transcription's stdout protocol: one NDJSON event per line, read by Bun.
+///
+/// The helper no longer types into the focused app. It reports what it heard and Bun keeps the
+/// running transcript, shows it, and pastes once when the Dictation ends, through the same
+/// pipeline a Batch Dictation uses. See docs/adr/0008-live-transcription-stages-in-an-overlay.md.
+/// The TypeScript side of this contract is `src/shared/parakeet-stream-protocol.ts`; the macOS
+/// helper writes the same three events.
+///
+/// - `partial` - the current hypothesis for the segment in progress; replaces the last one.
+/// - `commit` - a finished segment; clears the partial. An empty commit only clears it.
+/// - `final` - the session ended normally, after the last commit.
+///
+/// Shared by the audio loop and the stop path (the stdin thread and the drain deadline), so
+/// every write happens under one lock and only the first `finish` writes `final`; nothing is
+/// written after it. The macOS helper's `StreamEventSink` follows the same rule.
+#[derive(Default)]
+struct StreamEvents {
+    state: Mutex<StreamEventsState>,
+}
+
+#[derive(Default)]
+struct StreamEventsState {
+    /// The last partial written and not yet committed. A finish that the audio loop did not
+    /// reach commits it, so the words the user saw are the words pasted.
+    in_flight_partial: String,
+    finished: bool,
+}
+
+impl StreamEvents {
+    fn lock(&self) -> MutexGuard<'_, StreamEventsState> {
+        // A panic while holding the lock leaves nothing half-written that matters more than
+        // still being able to write `final`.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn paste_text(&mut self, text: &str) -> Result<(), String> {
-        if text.is_empty() {
+    fn partial(&self, text: &str) -> Result<(), String> {
+        let mut state = self.lock();
+        if state.finished {
             return Ok(());
         }
-        self.clipboard
-            .set_text(text.to_string())
-            .map_err(|err| format!("clipboard update failed: {err}"))?;
-        if inject::send_ctrl_v() {
-            Ok(())
-        } else {
-            Err("simulated Ctrl+V failed".to_string())
-        }
+        state.in_flight_partial = text.to_string();
+        emit_text_event("partial", text)
     }
 
-    fn replace_typed_segment(&mut self, typed: &mut String, next: &str) -> Result<(), String> {
-        let common = common_prefix_byte_len(typed, next);
-        let delete_chars = typed[common..].chars().count();
-        let insert = &next[common..];
-
-        if delete_chars > 0 {
-            let modifiers_released = inject::release_modifiers_for_text_injection();
-            let deleted = modifiers_released && inject::send_backspaces(delete_chars);
-            if !deleted {
-                return Err("failed to replace live transcript suffix".to_string());
-            }
+    fn commit(&self, text: &str) -> Result<(), String> {
+        let mut state = self.lock();
+        if state.finished {
+            return Ok(());
         }
+        if text.is_empty() && state.in_flight_partial.is_empty() {
+            return Ok(());
+        }
+        state.in_flight_partial.clear();
+        emit_text_event("commit", text)
+    }
 
-        self.paste_text(insert)?;
-        typed.clear();
-        typed.push_str(next);
-        Ok(())
+    /// Ends the session normally: commits the partial still in flight, if any, then writes
+    /// `final`. Does nothing when the session already finished. Each event is flushed as it is
+    /// written (`emit_json`).
+    fn finish(&self) -> Result<(), String> {
+        let mut state = self.lock();
+        Self::finish_locked(&mut state)
+    }
+
+    /// `finish`, then exit the process at once - from the stop path, while the audio loop may
+    /// still be inside a model load or a transcription pass that cannot be interrupted. The lock
+    /// is held until the process is gone, so the loop cannot write after `final`. Exits 0 when
+    /// `final` was written (by this caller or an earlier one), 1 when writing it failed.
+    fn finish_and_exit(&self) -> ! {
+        let mut state = self.lock();
+        let code = match Self::finish_locked(&mut state) {
+            Ok(()) => 0,
+            Err(err) => {
+                log_phase(format!("stream: {err}"));
+                1
+            }
+        };
+        std::process::exit(code)
+    }
+
+    fn finish_locked(state: &mut StreamEventsState) -> Result<(), String> {
+        if state.finished {
+            return Ok(());
+        }
+        state.finished = true;
+        let pending = clean_transcript(&std::mem::take(&mut state.in_flight_partial));
+        if !pending.is_empty() {
+            emit_text_event("commit", &pending)?;
+        }
+        emit_json(&StreamFinalEvent { kind: "final" })
+            .map_err(|err| format!("failed to write final event: {err}"))
     }
 }
 
-fn common_prefix_byte_len(a: &str, b: &str) -> usize {
-    let mut len = 0;
-    for (left, right) in a.chars().zip(b.chars()) {
-        if left != right {
-            break;
-        }
-        len += left.len_utf8();
+fn emit_text_event(kind: &'static str, text: &str) -> Result<(), String> {
+    emit_json(&StreamTextEvent { kind, text })
+        .map_err(|err| format!("failed to write {kind} event: {err}"))
+}
+
+/// How long the audio loop gets to finish its last segment after a stop, matching the macOS
+/// helper's `StreamStopRequest.drainDeadlineSeconds`. Bun kills a helper that has not exited
+/// 6s after the stop (`STREAM_STOP_DEADLINE_MS`) and reports the session as failed; this keeps
+/// the helper well inside that.
+const STREAM_STOP_DRAIN_DEADLINE: Duration = Duration::from_secs(3);
+
+/// What a stop does, decided by whether one already arrived and whether the audio loop exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopResponse {
+    /// No audio loop to drain yet - the model is still loading, or the input is opening. Write
+    /// `final` and exit now: nothing was heard, and the load alone can outlast Bun's deadline.
+    FinishNow,
+    /// The audio loop is running. Let it drain and commit the segment in progress, under
+    /// `STREAM_STOP_DRAIN_DEADLINE`.
+    DrainUnderDeadline,
+    /// A stop is already being handled.
+    AlreadyStopping,
+}
+
+fn stop_response(already_requested: bool, audio_loop_running: bool) -> StopResponse {
+    match (already_requested, audio_loop_running) {
+        (true, _) => StopResponse::AlreadyStopping,
+        (false, true) => StopResponse::DrainUnderDeadline,
+        (false, false) => StopResponse::FinishNow,
     }
-    len
+}
+
+/// The stop half of a stream session. The audio loop polls `is_requested`; the stdin thread
+/// calls `request`. The lock makes "the loop starts" and "a stop arrives" one ordering, so a
+/// stop is either seen by a running loop or finishes the session itself, never neither.
+#[derive(Default)]
+struct StreamStop {
+    requested: AtomicBool,
+    state: Mutex<StreamStopState>,
+}
+
+#[derive(Default)]
+struct StreamStopState {
+    requested: bool,
+    audio_loop_running: bool,
+}
+
+impl StreamStop {
+    fn lock(&self) -> MutexGuard<'_, StreamStopState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(AtomicOrdering::SeqCst)
+    }
+
+    /// The audio loop is about to run. False when a stop got here first: its handler has
+    /// already finished the session, and the loop must not start.
+    fn begin_audio_loop(&self) -> bool {
+        let mut state = self.lock();
+        if state.requested {
+            return false;
+        }
+        state.audio_loop_running = true;
+        true
+    }
+
+    fn request(&self) -> StopResponse {
+        let mut state = self.lock();
+        let response = stop_response(state.requested, state.audio_loop_running);
+        state.requested = true;
+        self.requested.store(true, AtomicOrdering::SeqCst);
+        response
+    }
+}
+
+/// One Live Transcription session's shared state: what has been written, and whether it is
+/// stopping. Shared by the audio loop, the stdin thread and the drain deadline.
+#[derive(Default)]
+struct StreamSession {
+    events: StreamEvents,
+    stop: StreamStop,
+}
+
+/// Every stop lands here. A stop before the audio loop exists finishes the session at once; the
+/// first stop once it runs arms the drain deadline, which finishes the session with the last
+/// partial if the loop has not finished it by then.
+fn handle_stream_stop(session: &Arc<StreamSession>, source: &str) {
+    let response = session.stop.request();
+    log_phase(format!("stream: stop requested ({source}): {response:?}"));
+    match response {
+        StopResponse::FinishNow => session.events.finish_and_exit(),
+        StopResponse::DrainUnderDeadline => {
+            let session = Arc::clone(session);
+            thread::spawn(move || {
+                thread::sleep(STREAM_STOP_DRAIN_DEADLINE);
+                log_phase("stream: drain deadline passed - finishing with the last partial");
+                session.events.finish_and_exit();
+            });
+        }
+        StopResponse::AlreadyStopping => {}
+    }
+}
+
+/// The stream session's stop channel: a `stop` line on stdin, or stdin closing (the host went
+/// away, or Bun closed the pipe after writing `stop`). Bun cannot signal a Windows process
+/// gracefully. Only the first of those counts: Bun writes `stop` and closes stdin straight
+/// after, and that close must not cut the drain short.
+///
+/// A `cancel` line ends the session at once instead: Bun will not paste this session's text
+/// (Escape, or a stop the app made), so it commits the partial last written, writes `final`
+/// and exits 0 with no final transcription pass, letting Bun release the Dictation pipeline
+/// straight away. The macOS helper reads the same two lines.
+fn spawn_stream_stdin_thread(session: Arc<StreamSession>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            match stream_control_command(&line) {
+                Some(StreamControlCommand::Stop) => {
+                    handle_stream_stop(&session, "stdin stop");
+                    return;
+                }
+                Some(StreamControlCommand::Cancel) => {
+                    log_phase("stream: cancel requested (stdin) - finishing without a final pass");
+                    session.events.finish_and_exit();
+                }
+                None => {}
+            }
+        }
+        handle_stream_stop(&session, "stdin closed");
+    })
+}
+
+/// A line Bun writes to a stream session's stdin. `src/shared/parakeet-stream-protocol.ts`
+/// (`StreamStopCommand`) is the other side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamControlCommand {
+    Stop,
+    Cancel,
+}
+
+fn stream_control_command(line: &str) -> Option<StreamControlCommand> {
+    let line = line.trim();
+    if line.eq_ignore_ascii_case("stop") {
+        Some(StreamControlCommand::Stop)
+    } else if line.eq_ignore_ascii_case("cancel") {
+        Some(StreamControlCommand::Cancel)
+    } else {
+        None
+    }
 }
 
 fn log_phase(message: impl AsRef<str>) {
@@ -257,33 +462,6 @@ fn resolve_live_utterance_text(final_raw: &str, last_partial: &str) -> String {
     }
 }
 
-fn completed_stable_prefix(previous: &str, current: &str) -> String {
-    let common = common_prefix_byte_len(previous, current);
-    let common_prefix = &current[..common];
-    let trimmed = common_prefix.trim_end();
-    let Some(last_boundary) = trimmed.rfind(char::is_whitespace) else {
-        return String::new();
-    };
-    clean_transcript(&trimmed[..last_boundary])
-}
-
-fn append_live_prefix(
-    injector: &mut TextInjector,
-    typed_utterance: &mut String,
-    next_prefix: &str,
-) -> Result<(), String> {
-    if next_prefix.len() <= typed_utterance.len()
-        || !next_prefix.starts_with(typed_utterance.as_str())
-    {
-        return Ok(());
-    }
-
-    let insert = &next_prefix[typed_utterance.len()..];
-    injector.paste_text(insert)?;
-    typed_utterance.push_str(insert);
-    Ok(())
-}
-
 pub fn handle_transcribe(args: &[String]) -> ExitCode {
     if args.len() < 4 {
         eprintln!("CodictateWindowsHelper transcribe <wavPath> <parakeetModelDir>");
@@ -372,9 +550,13 @@ pub fn handle_stream(args: &[String]) -> ExitCode {
     let mode = &args[2];
     let model_dir = &args[3];
     let device_ref = args.get(4).map(String::as_str);
+    // Started before the model load, so a stop that lands during it still ends the session
+    // with a `final` instead of waiting out a DirectML load. See `handle_stream_stop`.
+    let session = Arc::new(StreamSession::default());
+    let _stdin_thread = spawn_stream_stdin_thread(Arc::clone(&session));
     let result = match mode.as_str() {
-        "vad" => run_vad_stream(model_dir, device_ref),
-        "live" => run_live_stream(model_dir, device_ref),
+        "vad" => run_vad_stream(model_dir, device_ref, &session),
+        "live" => run_live_stream(model_dir, device_ref, &session),
         other => Err(format!("unknown stream mode: {other}")),
     };
 
@@ -387,11 +569,24 @@ pub fn handle_stream(args: &[String]) -> ExitCode {
     }
 }
 
-fn run_vad_stream(model_dir: &str, device_ref: Option<&str>) -> Result<(), String> {
+fn run_vad_stream(
+    model_dir: &str,
+    device_ref: Option<&str>,
+    session: &StreamSession,
+) -> Result<(), String> {
     let mut model = load_model(model_dir)?;
-    let mut injector = TextInjector::new()?;
+    let events = &session.events;
+    if session.stop.is_requested() {
+        log_phase("stream [vad]: stopped before audio input opened");
+        return events.finish();
+    }
     let input = open_input_sample_stream(device_ref)?;
     let mut resampler = StreamingResampler::new(input.sample_rate)?;
+    if !session.stop.begin_audio_loop() {
+        log_phase("stream [vad]: stopped while audio input opened");
+        drop(input);
+        return events.finish();
+    }
     log_phase("stream [vad]: audio input running");
 
     const RMS_THRESHOLD: f32 = 0.012;
@@ -404,10 +599,16 @@ fn run_vad_stream(model_dir: &str, device_ref: Option<&str>) -> Result<(), Strin
     let mut silence_accum = 0usize;
 
     loop {
+        if session.stop.is_requested() {
+            log_phase("stream [vad]: stop requested");
+            break;
+        }
         let input_chunk = match input.recv_timeout(STREAM_RECV_TIMEOUT) {
             Ok(chunk) => chunk,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err("audio input disconnected mid-session".to_string());
+            }
         };
 
         resampler.process(&input_chunk, |chunk| {
@@ -424,7 +625,7 @@ fn run_vad_stream(model_dir: &str, device_ref: Option<&str>) -> Result<(), Strin
                     if let Some(text) = transcribe_for_stream(&mut model, &utterance)
                         && !text.is_empty()
                     {
-                        injector.paste_text(&(text + " "))?;
+                        events.commit(&text)?;
                     }
                     utterance.clear();
                 }
@@ -442,7 +643,7 @@ fn run_vad_stream(model_dir: &str, device_ref: Option<&str>) -> Result<(), Strin
                         && let Some(text) = transcribe_for_stream(&mut model, &utterance)
                         && !text.is_empty()
                     {
-                        injector.paste_text(&(text + " "))?;
+                        events.commit(&text)?;
                     }
                     utterance.clear();
                 }
@@ -451,14 +652,44 @@ fn run_vad_stream(model_dir: &str, device_ref: Option<&str>) -> Result<(), Strin
         })?;
     }
 
-    Ok(())
+    // Audio still queued behind the last pass is the end of what the user said before the
+    // stop. It only extends the utterance in progress; no transcription runs on it here.
+    drain_after_stop(input, &mut resampler, |chunk| {
+        if in_speech {
+            utterance.extend_from_slice(chunk);
+        }
+    })?;
+    // Stopped mid-utterance: the speech never reached its silence commit, and with push-to-talk
+    // that is the usual case for the last thing said.
+    if in_speech
+        && utterance.len() >= MIN_UTTERANCE
+        && let Some(text) = transcribe_for_stream(&mut model, &utterance)
+        && !text.is_empty()
+    {
+        log_phase("stream [vad]: committed the utterance in progress at stop");
+        events.commit(&text)?;
+    }
+    events.finish()
 }
 
-fn run_live_stream(model_dir: &str, device_ref: Option<&str>) -> Result<(), String> {
+fn run_live_stream(
+    model_dir: &str,
+    device_ref: Option<&str>,
+    session: &StreamSession,
+) -> Result<(), String> {
     let mut model = load_model(model_dir)?;
-    let mut injector = TextInjector::new()?;
+    let events = &session.events;
+    if session.stop.is_requested() {
+        log_phase("stream [live]: stopped before audio input opened");
+        return events.finish();
+    }
     let input = open_input_sample_stream(device_ref)?;
     let mut resampler = StreamingResampler::new(input.sample_rate)?;
+    if !session.stop.begin_audio_loop() {
+        log_phase("stream [live]: stopped while audio input opened");
+        drop(input);
+        return events.finish();
+    }
     log_phase("stream [live]: audio input running");
 
     const RMS_THRESHOLD: f32 = 0.010;
@@ -473,13 +704,18 @@ fn run_live_stream(model_dir: &str, device_ref: Option<&str>) -> Result<(), Stri
     let mut silence_accum = 0usize;
     let mut samples_since_last_update = 0usize;
     let mut last_partial_text = String::new();
-    let mut typed_utterance = String::new();
 
     loop {
+        if session.stop.is_requested() {
+            log_phase("stream [live]: stop requested");
+            break;
+        }
         let input_chunk = match input.recv_timeout(STREAM_RECV_TIMEOUT) {
             Ok(chunk) => chunk,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err("audio input disconnected mid-session".to_string());
+            }
         };
 
         resampler.process(&input_chunk, |chunk| {
@@ -492,40 +728,30 @@ fn run_live_stream(model_dir: &str, device_ref: Option<&str>) -> Result<(), Stri
                         utterance.clear();
                         samples_since_last_update = 0;
                         last_partial_text.clear();
-                        typed_utterance.clear();
                         log_phase("stream [live]: voice active");
                     }
 
                     utterance.extend_from_slice(chunk);
                     samples_since_last_update += chunk.len();
 
+                    // Stopping: a partial pass nobody will see would only spend the drain
+                    // deadline the stop commit needs.
                     let should_emit_update = utterance.len() >= MIN_SAMPLES_FOR_INFER
-                        && samples_since_last_update >= MIN_SAMPLES_BETWEEN_UPDATES;
+                        && samples_since_last_update >= MIN_SAMPLES_BETWEEN_UPDATES
+                        && !session.stop.is_requested();
                     if should_emit_update {
                         samples_since_last_update = 0;
                         if let Some(partial_text) = transcribe_for_stream(&mut model, &utterance)
                             && !partial_text.is_empty()
                             && partial_text != last_partial_text
                         {
-                            let stable_prefix =
-                                completed_stable_prefix(&last_partial_text, &partial_text);
-                            append_live_prefix(
-                                &mut injector,
-                                &mut typed_utterance,
-                                &stable_prefix,
-                            )?;
+                            events.partial(&partial_text)?;
                             last_partial_text = partial_text;
                         }
                     }
 
                     if utterance.len() >= MAX_UTTERANCE {
-                        commit_live_utterance(
-                            &mut model,
-                            &mut injector,
-                            &mut typed_utterance,
-                            &utterance,
-                            &last_partial_text,
-                        )?;
+                        commit_live_utterance(&mut model, events, &utterance, &last_partial_text)?;
                         utterance.clear();
                         samples_since_last_update = 0;
                         last_partial_text.clear();
@@ -539,11 +765,10 @@ fn run_live_stream(model_dir: &str, device_ref: Option<&str>) -> Result<(), Stri
                         in_speech = false;
                         silence_accum = 0;
                         log_phase("stream [live]: silence commit");
-                        if utterance.len() >= MIN_UTTERANCE || !typed_utterance.is_empty() {
+                        if utterance.len() >= MIN_UTTERANCE || !last_partial_text.is_empty() {
                             commit_live_utterance(
                                 &mut model,
-                                &mut injector,
-                                &mut typed_utterance,
+                                events,
                                 &utterance,
                                 &last_partial_text,
                             )?;
@@ -559,13 +784,56 @@ fn run_live_stream(model_dir: &str, device_ref: Option<&str>) -> Result<(), Stri
         })?;
     }
 
+    // Same as the vad loop: queued audio extends the segment in progress, and no partial pass
+    // runs on it - nobody would see one, and the stop commit below transcribes all of it.
+    drain_after_stop(input, &mut resampler, |chunk| {
+        if in_speech {
+            utterance.extend_from_slice(chunk);
+        }
+    })?;
+    // Stopped mid-segment, which with push-to-talk is how the last segment always ends.
+    if in_speech && (utterance.len() >= MIN_UTTERANCE || !last_partial_text.is_empty()) {
+        log_phase("stream [live]: stop commit");
+        commit_live_utterance(&mut model, events, &utterance, &last_partial_text)?;
+    }
+    events.finish()
+}
+
+/// Stops capture, then feeds every chunk still queued in the input channel - and the
+/// resampler's own tail - to `on_chunk` at the recording rate. Without this a stop dropped
+/// whatever the capture thread had queued while the loop was busy in a transcription pass,
+/// which is the last words before a push-to-talk release. The macOS helper delivers its queued
+/// chunks the same way before its loop ends.
+fn drain_after_stop(
+    input: InputSampleStream,
+    resampler: &mut StreamingResampler,
+    mut on_chunk: impl FnMut(&[f32]),
+) -> Result<(), String> {
+    let queued = input.stop_and_drain();
+    let queued_samples: usize = queued.iter().map(Vec::len).sum();
+    for input_chunk in &queued {
+        resampler.process(input_chunk, |chunk| {
+            on_chunk(chunk);
+            Ok(())
+        })?;
+    }
+    resampler.finish(|chunk| {
+        on_chunk(chunk);
+        Ok(())
+    })?;
+    log_phase(format!(
+        "stream: drained {} queued chunks ({} input samples) after stop",
+        queued.len(),
+        queued_samples
+    ));
     Ok(())
 }
 
+/// The segment's final pass, written as a `commit`. Falls back to the last partial when the
+/// full-buffer pass fails or comes back empty, so a segment the user watched does not vanish.
 fn commit_live_utterance(
     model: &mut ParakeetTDT,
-    injector: &mut TextInjector,
-    typed_utterance: &mut String,
+    events: &StreamEvents,
     utterance: &[f32],
     last_partial_text: &str,
 ) -> Result<(), String> {
@@ -573,16 +841,7 @@ fn commit_live_utterance(
         Some(raw) => resolve_live_utterance_text(&raw, last_partial_text),
         None => clean_transcript(last_partial_text),
     };
-    if final_text.is_empty() {
-        return Ok(());
-    }
-
-    injector.replace_typed_segment(typed_utterance, &final_text)?;
-    if !inject::send_space() {
-        return Err("failed to insert trailing space".to_string());
-    }
-    typed_utterance.clear();
-    Ok(())
+    events.commit(&final_text)
 }
 
 #[cfg(test)]
@@ -630,27 +889,22 @@ mod tests {
     }
 
     #[test]
-    fn stable_prefix_lags_by_one_completed_word() {
-        assert_eq!(
-            completed_stable_prefix("hello world", "hello world again"),
-            "hello"
-        );
-    }
+    fn stream_events_emit_the_shared_protocol_shapes() {
+        let partial = serde_json::to_string(&StreamTextEvent {
+            kind: "partial",
+            text: "hello wor",
+        })
+        .expect("partial event should encode");
+        let commit = serde_json::to_string(&StreamTextEvent {
+            kind: "commit",
+            text: "hello world",
+        })
+        .expect("commit event should encode");
+        let final_event = serde_json::to_string(&StreamFinalEvent { kind: "final" })
+            .expect("final event should encode");
 
-    #[test]
-    fn stable_prefix_waits_for_punctuation_to_settle() {
-        assert_eq!(completed_stable_prefix("hello world", "hello, world"), "");
-        assert_eq!(
-            completed_stable_prefix("hello, world", "hello, world again"),
-            "hello,"
-        );
-    }
-
-    #[test]
-    fn stable_prefix_can_grow_beyond_one_word() {
-        assert_eq!(
-            completed_stable_prefix("hello brave world", "hello brave world again"),
-            "hello brave"
-        );
+        assert_eq!(partial, r#"{"kind":"partial","text":"hello wor"}"#);
+        assert_eq!(commit, r#"{"kind":"commit","text":"hello world"}"#);
+        assert_eq!(final_event, r#"{"kind":"final"}"#);
     }
 }

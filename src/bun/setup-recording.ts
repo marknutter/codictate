@@ -20,7 +20,10 @@ import {
   startParakeetStream,
   stopParakeetStream,
   type StreamSession,
+  type StreamSessionEnd,
 } from './utils/whisper/parakeet-stream-runner'
+import { streamStopCommandFor } from '../shared/parakeet-stream-protocol'
+import { stagedTextForHistory } from '../shared/scratch-command'
 import {
   blockedDictationPlan,
   type BlockedDictationPlan,
@@ -42,6 +45,7 @@ import {
 } from './utils/sound/play-sound'
 import { AppConfig } from './AppConfig/AppConfig'
 import type { TrayHandlers } from './setup-tray'
+import type { LiveTranscriptUpdate } from './utils/window/staging-overlay-text'
 import { findDevices, type AudioDeviceSnapshot } from './utils/audio/devices'
 import {
   resolveInputDevice,
@@ -49,8 +53,15 @@ import {
 } from './utils/audio/resolve-input-device'
 import { DICTATION_HOLD_QUALIFY_MS } from '../shared/dictation-shortcut'
 import type { AppStatus, ShortcutId } from '../shared/types'
-import { runDictation, type DictationOutcome } from './dictation/run-dictation'
-import type { FailedTranscription } from './utils/whisper/engines/transcription'
+import {
+  outcomeFromTranscript,
+  runDictation,
+  type DictationOutcome,
+} from './dictation/run-dictation'
+import {
+  failedTranscription,
+  type FailedTranscription,
+} from './utils/whisper/engines/transcription'
 import { windowsUsesModifierReleaseHold } from '../shared/shortcut-options'
 import { checkMicrophoneAuthorization } from './utils/audio/check-mic-authorization'
 import { log } from './utils/logger'
@@ -75,6 +86,18 @@ function holdFnChordConflictsWithFnGlobeMain(
     hybridId === 'fn-globe' && holdId !== null && isModifierChord(holdId, 'fn')
   )
 }
+
+/**
+ * Why a Live Transcription is ending, which decides what happens to its staged text.
+ *
+ * - `commit` - the user ended the Dictation. The text goes through the Dictation pipeline and
+ *   is pasted once, exactly like a Batch Dictation's transcript. ADR-0008.
+ * - `cancel` - Escape. Nothing is pasted or recorded, like an Escaped Batch Dictation.
+ * - `abandon` - the app ended it: a settings change, quit, Live Transcription switched off, a
+ *   blocked press. Nothing is pasted into whatever has focus, but the staged text is kept in
+ *   History so the words are not lost.
+ */
+type LiveStopIntent = 'commit' | 'cancel' | 'abandon'
 
 function mergeSwallowRules(a: KeyEvent[], b: KeyEvent[]): KeyEvent[] {
   const seen = new Set<string>()
@@ -119,7 +142,14 @@ export const setupRecording = (
    * blocked plan gets - notification or banner - and deliberately not the third: no heal
    * pass. See `reportFailedDictation` below.
    */
-  onDictationFailed?: (failure: FailedTranscription) => Promise<void>
+  onDictationFailed?: (failure: FailedTranscription) => Promise<void>,
+  /**
+   * The running transcript of a Live Transcription changed: committed segments plus the
+   * current partial, and the Transcription Language of the plan the stream started with, so
+   * the overlay applies the Scratch Command by the same rule the paste does. For the Staging
+   * Overlay to draw; nothing is pasted until the end.
+   */
+  onLiveTranscriptText?: (update: LiveTranscriptUpdate) => void
 ) => {
   let recorderProc: ReturnType<typeof Bun.spawn> | null = null
   let recordingSession: RecordingSession | null = null
@@ -133,6 +163,8 @@ export const setupRecording = (
 
   // Stream mode state
   let streamSession: StreamSession | null = null
+  /** The plan the running stream was started from. Its Outcome records this plan's facts. */
+  let activeStreamPlan: RunnableDictationPlan | null = null
   let streamStarting = false
   /** When stream was started via push-to-talk, release must stop (unlike hybrid tap-to-toggle). */
   let activeStreamShortcutMode: 'hybrid' | 'holdOnly' | null = null
@@ -344,6 +376,54 @@ export const setupRecording = (
   }
 
   /**
+   * Paste a Dictation Outcome and record it in History and stats. Batch Dictation and Live
+   * Transcription both end here, so they write the same History entry and stats row.
+   *
+   * An empty output is a Dictation the Speech Engine heard nothing in, and it writes
+   * nothing: no paste, no history entry, no stats row, no error chime. It used to paste an
+   * empty string over the cursor and count a zero-word stats row.
+   */
+  const deliverDictationOutcome = async (outcome: DictationOutcome) => {
+    if (outcome.output === '') return
+    await pasteTranscript(outcome.output)
+
+    if (onHistorySave) {
+      try {
+        await onHistorySave(outcome.output)
+      } catch (err) {
+        log('history', 'failed to save entry', { err: String(err) })
+      }
+    }
+    if (onStatsSave) {
+      try {
+        await onStatsSave(outcome)
+      } catch (err) {
+        log('stats', 'failed to save session', { err: String(err) })
+      }
+    }
+  }
+
+  /**
+   * Keep a Live Transcription's staged text that will not be pasted, so the words are not
+   * lost. History only: no paste, and no stats row, because no Dictation Outcome was made.
+   * The Scratch Command is applied first, as the overlay showed it; nothing is saved when
+   * nothing is left.
+   */
+  const saveStagedTextToHistory = async (
+    plan: RunnableDictationPlan,
+    stagedText: string
+  ) => {
+    if (!onHistorySave) return
+    const text = stagedTextForHistory(stagedText, plan.transcriptionLanguageId)
+    if (text === '') return
+    try {
+      await onHistorySave(text)
+    } catch (err) {
+      log('history', 'failed to save staged live text', { err: String(err) })
+    }
+  }
+
+  /**
    * The capture is over; everything after it happens here.
    *
    * The order is load-bearing and unchanged from when it lived inside the mic process's
@@ -393,31 +473,85 @@ export const setupRecording = (
         onAppliedEntries: (entries) => appConfig.notifyAppliedEntries(entries),
       })
 
-      // An empty output is a Dictation the Speech Engine heard nothing in, and it writes
-      // nothing: no paste, no history entry, no stats row, no error chime. It used to paste
-      // an empty string over the cursor and count a zero-word stats row.
       if (outcome.status === 'failed') {
         failure = outcome
-      } else if (outcome.output !== '') {
-        await pasteTranscript(outcome.output)
-
-        if (onHistorySave) {
-          try {
-            await onHistorySave(outcome.output)
-          } catch (err) {
-            log('history', 'failed to save entry', { err: String(err) })
-          }
-        }
-        if (onStatsSave) {
-          try {
-            await onStatsSave(outcome)
-          } catch (err) {
-            log('stats', 'failed to save session', { err: String(err) })
-          }
-        }
+      } else {
+        await deliverDictationOutcome(outcome)
       }
     } catch (err) {
       log('whisper', 'transcription pipeline failed', {
+        err: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      releaseDictationPipeline()
+    }
+
+    if (failure !== null) await reportFailedDictation(failure)
+  }
+
+  /**
+   * A Live Transcription has ended and its helper has exited; everything after it happens here.
+   *
+   * The mirror of `handleCaptureFinished`. The helper already transcribed what the user said,
+   * so the staged text enters the Dictation pipeline after the Speech Engine - Dictionary,
+   * Formatting Mode - and is pasted once, on the statement after the pipeline returns. A
+   * helper that did not finish the session is a failed Dictation: nothing is pasted, and the
+   * staged text goes to History. ADR-0008.
+   */
+  const finishLiveTranscription = async (
+    plan: RunnableDictationPlan,
+    end: StreamSessionEnd,
+    intent: LiveStopIntent,
+    durationMs: number
+  ) => {
+    // Held rather than reported inline, for the same reason as in `handleCaptureFinished`:
+    // the tray error state has to outlive the release below.
+    let failure: FailedTranscription | null = null
+
+    try {
+      log('stream', 'live transcription ended', {
+        intent,
+        status: end.status,
+        chars: end.text.length,
+        durationMs,
+      })
+      if (intent === 'cancel') {
+        // Escape: the user threw it away. Nothing pasted, nothing recorded.
+      } else if (end.status === 'failed') {
+        log('stream', 'live transcription helper did not finish the session', {
+          exitCode: end.exitCode,
+          diagnostic: end.diagnostic,
+        })
+        await saveStagedTextToHistory(plan, end.text)
+        // An app-initiated stop has its own surface already (quit, a settings change, a
+        // blocked press). Only a Dictation the user was running reports the failure.
+        if (intent === 'commit') {
+          failure = failedTranscription(
+            'live_transcription_interrupted',
+            plan.speechModelId,
+            end.diagnostic
+          )
+        }
+      } else if (intent === 'abandon') {
+        await saveStagedTextToHistory(plan, end.text)
+      } else {
+        // The previous Dictation's Dictionary hits are promoted now, before this one records
+        // its own - the same bookkeeping a Batch Dictation does.
+        await appConfig.acceptPreviouslyAppliedEntries()
+
+        const outcome = await outcomeFromTranscript({
+          plan,
+          rawTranscript: end.text,
+          durationMs,
+          formattingSettings: appConfig.getFormattingRuntimeSettings(),
+          dictionaryEntries: appConfig.getDictionaryEntries(),
+          onAppliedEntries: (entries) =>
+            appConfig.notifyAppliedEntries(entries),
+        })
+        await deliverDictationOutcome(outcome)
+      }
+    } catch (err) {
+      log('stream', 'live transcription pipeline failed', {
         err: err instanceof Error ? err.message : String(err),
       })
     } finally {
@@ -439,7 +573,7 @@ export const setupRecording = (
       // the press that notices must not leave the helper running.
       if (streamSession !== null) {
         logShortcutDecision(reason, mode, 'stop', keyEvent, plan.mode)
-        await tryStopStream()
+        await tryStopStream('abandon')
       }
       logShortcutDecision(reason, mode, 'blocked', keyEvent, plan.mode)
       await reportBlockedDictation(plan)
@@ -450,7 +584,7 @@ export const setupRecording = (
 
     if (plan.mode !== 'live' && streamSession !== null) {
       log('shortcut', 'stopping orphan Parakeet stream (stream mode off)')
-      await tryStopStream()
+      await tryStopStream('abandon')
     }
     if (plan.mode === 'live') {
       logShortcutDecision(
@@ -460,7 +594,7 @@ export const setupRecording = (
         keyEvent,
         plan.mode
       )
-      if (streamSession !== null) await tryStopStream()
+      if (streamSession !== null) await tryStopStream('commit')
       else await tryStartStream(plan, mode)
       return
     }
@@ -507,15 +641,11 @@ export const setupRecording = (
         plan,
         appConfig.getStreamTranscriptionMode(),
         {
-          onStopped: () => {
-            log('stream', 'stream session onStopped (process exit)', {
-              streamDebugId,
-            })
-            streamSession = null
-            activeStreamShortcutMode = null
-            setTrayIdle()
-            onStatusChange?.('ready')
-          },
+          onText: (transcript) =>
+            onLiveTranscriptText?.({
+              ...transcript,
+              transcriptionLanguageId: plan.transcriptionLanguageId,
+            }),
         },
         {
           streamDebugId,
@@ -536,10 +666,34 @@ export const setupRecording = (
         await reportBlockedDictation(started.plan)
         return
       }
-      streamSession = started.session
-      if (pendingStreamHoldReleaseWhileStarting && streamSession !== null) {
+      const session = started.session
+      streamSession = session
+      activeStreamPlan = plan
+      // The helper ended the session without being asked: a crash, a lost microphone. A stop
+      // this module requested clears `streamSession` first and handles the end itself.
+      void session.ended.then(async (end) => {
+        if (streamSession !== session) return
+        log('stream', 'Parakeet helper ended the session on its own', {
+          streamDebugId,
+          status: end.status,
+        })
+        streamSession = null
+        activeStreamPlan = null
+        activeStreamShortcutMode = null
         resetHoldGate()
-        await tryStopStream()
+        transcriptionPipelineActive = true
+        setTrayTranscribing()
+        onStatusChange?.('transcribing')
+        await finishLiveTranscription(
+          plan,
+          end,
+          'commit',
+          Date.now() - session.startedAtMs
+        )
+      })
+      if (pendingStreamHoldReleaseWhileStarting) {
+        resetHoldGate()
+        await tryStopStream('commit')
       } else if (streamSession !== null) {
         if (shortcutMode === 'hybrid') armHoldGateAfterStart()
         else resetHoldGate()
@@ -564,19 +718,58 @@ export const setupRecording = (
     }
   }
 
-  const tryStopStream = async () => {
-    if (streamSession === null) return
-    const streamDebugId = streamSession.streamDebugId
-    log('stream', 'stopping stream session', { streamDebugId })
+  /**
+   * End the running Live Transcription.
+   *
+   * The helper is always asked to exit, never killed first: it writes `final`, restores the
+   * output volume it ducked, and exits. A Dictation that pastes sends `stop`, which also
+   * transcribes the segment in progress; Escape and an app-initiated stop send `cancel`,
+   * which skips that pass, so the window below is milliseconds. The Dictation pipeline stays
+   * held until the helper has exited, so a press in that window cannot start a second helper,
+   * and `ready` is not reported until the pipeline is released: a press refused while the
+   * app still claims to be ready would be a press that silently did nothing.
+   */
+  const tryStopStream = async (intent: LiveStopIntent) => {
+    if (streamSession === null || activeStreamPlan === null) return
     const session = streamSession
+    const plan = activeStreamPlan
+    const durationMs = Date.now() - session.startedAtMs
+    log('stream', 'stopping stream session', {
+      streamDebugId: session.streamDebugId,
+      intent,
+    })
     streamSession = null
+    activeStreamPlan = null
     activeStreamShortcutMode = null
     pendingStreamHoldReleaseWhileStarting = false
     pendingStreamHoldReleaseStartedAtMs = 0
     resetHoldGate()
-    await stopParakeetStream(session)
-    setTrayIdle()
-    onStatusChange?.('ready')
+    transcriptionPipelineActive = true
+
+    // Same order as a Batch Dictation: tray and indicator to transcribing, then the end chime.
+    // The helper's last segment and the pipeline both run under `transcribing`. A cancel or an
+    // abandon is busy too until the helper exits - `releaseDictationPipeline` reports `ready`
+    // - but has no end chime: Escape already played the cancel chime, and an app-initiated
+    // stop is not the user ending a Dictation.
+    setTrayTranscribing()
+    onStatusChange?.('transcribing')
+    if (intent === 'commit' && appConfig.getSoundEffectsEnabled())
+      playEndSound(appConfig.getFunModeEnabled())
+
+    // `finishLiveTranscription` is what releases the Dictation pipeline, so it must be reached
+    // even if the stop itself throws.
+    let end: StreamSessionEnd
+    try {
+      end = await stopParakeetStream(session, streamStopCommandFor(intent))
+    } catch (err) {
+      end = {
+        status: 'failed',
+        text: session.text(),
+        exitCode: null,
+        diagnostic: err instanceof Error ? err.message : String(err),
+      }
+    }
+    await finishLiveTranscription(plan, end, intent, durationMs)
   }
 
   const tryStop = async () => {
@@ -698,7 +891,7 @@ export const setupRecording = (
             'stop',
             keyEvent
           )
-          await tryStopStream()
+          await tryStopStream('commit')
         }
         return
       }
@@ -708,7 +901,7 @@ export const setupRecording = (
       if (streamSession !== null) {
         log('shortcut', 'escape stopping active stream session')
         if (appConfig.getSoundEffectsEnabled()) playCancelSound()
-        void tryStopStream()
+        void tryStopStream('cancel')
         return
       }
       if (recorderProc) {
@@ -911,8 +1104,9 @@ export const setupRecording = (
     relayPermissions
   )
 
+  /** The app is ending the stream (settings change, quit, mode off): never a paste. */
   const stopActiveParakeetStream = async () => {
-    await tryStopStream()
+    await tryStopStream('abandon')
   }
 
   return {

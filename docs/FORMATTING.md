@@ -1,6 +1,6 @@
 # Output formatting
 
-Formatting rewrites a completed Batch Dictation before Codictate pastes it. Live Transcription bypasses formatting.
+Formatting rewrites a completed Dictation before Codictate pastes it. That includes Live Transcription: its staged text goes through the same Dictionary and Formatting Mode when the Dictation ends, and is pasted once.
 
 ## Models
 
@@ -17,6 +17,17 @@ S1-mini cannot implement Qwen's arbitrary instructions. Unsupported controls are
 An explicit non-English transcription language skips S1-mini. Translate to English makes the output eligible. Automatic-language transcription, including Parakeet, requires conservative text-language detection; short, non-English or uncertain text stays unchanged. Detection is imperfect, especially for mixed-language text. Codictate never switches to another model for these cases.
 
 A successful empty result, such as cleanup of filler-only speech, means nothing is pasted. A runtime failure preserves the transcript. There is no promised latency: users can try the model and decide whether its output and speed suit them.
+
+## Self-correction Cleanup
+
+"Clean up self-corrections" (Settings, Auto-polish, under Corrections; off by default) resolves spoken self-corrections with the selected Formatting Model: "meet at three, no, four" is pasted as "meet at four". It runs after the Dictionary and before the Formatting Mode, whether or not Auto-polish is on, and is stored as `formatting.selfCorrectionCleanup` in `main-config.json`.
+
+- **Qwen** gets a dedicated instruction that resolves self-corrections and changes nothing else, through the same JSON-schema runner as the other Qwen calls. Any language.
+- **S1-mini** cannot take that instruction; its own protocol resolves self-corrections as part of its cleanup. With Auto-polish on, the S1-mini Formatting Mode pass already does this, so no second S1-mini pass runs. With Auto-polish off, the cleanup step runs S1-mini once, with the general writing style and prose structure. English only, the same eligibility rule as formatting.
+- It needs the selected Formatting Model installed (ADR-0005): the toggle is disabled with the reason when it is not, a write that turns it on is refused, and removing the model switches it off with a notice.
+- An inference failure, or an empty result for non-empty text, keeps the uncleaned transcript and continues to the Formatting Mode (ADR-0006). The failure is logged.
+
+There is no Apple Intelligence variant: the formatting runner's only backend is llama.cpp.
 
 ## Runtime contract
 

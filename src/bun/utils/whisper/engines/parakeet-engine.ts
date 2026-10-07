@@ -2,9 +2,10 @@ import { requireRuntimeBinary } from '../../../platform/binaries'
 /**
  * The Parakeet Speech Engine Adapter: one batch transcription on the Parakeet Native Helper.
  *
- * Batch only. Live Transcription stays outside this interface - the helper captures the mic
- * and pastes for itself, so there is nothing to return - and lives in
- * `parakeet-stream-runner.ts`. See docs/adr/0006-dictation-returns-an-outcome.md.
+ * Batch only. Live Transcription stays outside this interface - it is a session the helper
+ * streams events from, not a request with one result - and lives in
+ * `parakeet-stream-runner.ts`. See docs/adr/0006-dictation-returns-an-outcome.md and
+ * docs/adr/0008-live-transcription-stages-in-an-overlay.md.
  */
 
 import { existsSync } from 'node:fs'

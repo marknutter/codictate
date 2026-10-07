@@ -55,6 +55,22 @@ impl InputSampleStream {
     ) -> Result<Vec<f32>, crossbeam_channel::RecvTimeoutError> {
         self.rx.recv_timeout(timeout)
     }
+
+    /// Stops capture and returns every chunk still queued behind the consumer, oldest first.
+    ///
+    /// The source is stopped before the queue is read, so the read ends: a running cpal stream
+    /// or WASAPI worker would otherwise keep refilling it. The WASAPI worker drains its last
+    /// packets into the queue as it stops, and those are included. A stream session uses this
+    /// at stop so the words still queued behind a slow transcription pass are not dropped.
+    pub fn stop_and_drain(self) -> Vec<Vec<f32>> {
+        let InputSampleStream {
+            rx,
+            _source: source,
+            ..
+        } = self;
+        drop(source);
+        rx.try_iter().collect()
+    }
 }
 
 impl Drop for InputSampleSource {
@@ -105,7 +121,8 @@ fn finish_recording_worker(
         .map_err(|_| "sample worker panicked".to_string())?
 }
 
-fn spawn_stdin_stop_thread(stop_flag: Arc<AtomicBool>) -> JoinHandle<()> {
+/// Sets `stop_flag` on a `stop` line or when stdin closes. Shared by `record` and `stream`.
+pub(crate) fn spawn_stdin_stop_thread(stop_flag: Arc<AtomicBool>) -> JoinHandle<()> {
     thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {

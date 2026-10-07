@@ -174,6 +174,7 @@ const s1RuntimeSettings: FormattingRuntimeSettings = {
   userDisplayName: 'Emil',
   formatterModelTier: 's1-mini',
   s1: { styling: 'semi-formal', structure: 'prose' },
+  selfCorrectionCleanup: false,
   email: {
     includeSenderName: true,
     greetingStyle: 'custom',

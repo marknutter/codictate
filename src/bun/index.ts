@@ -656,7 +656,10 @@ function startKeyboard() {
       }
     },
     reportDictationPlan,
-    reportFailedDictation
+    reportFailedDictation,
+    // The Staging Overlay: the indicator shapes the running transcript and shows it while
+    // the Live Transcription streams. Nothing is pasted until the Dictation ends.
+    (update) => indicatorRef.current?.onLiveText(update)
   )
 }
 

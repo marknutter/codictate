@@ -338,11 +338,6 @@ private final class StreamOutputDuckCoordinator: @unchecked Sendable {
   }
 }
 
-private enum StreamSignalHandlers {
-  nonisolated(unsafe) static var sigint: DispatchSourceSignal?
-  nonisolated(unsafe) static var sigterm: DispatchSourceSignal?
-}
-
 private func outputDuckDelaySecondsFromEnv() -> TimeInterval {
   let raw = ProcessInfo.processInfo.environment["CODICTATE_OUTPUT_DUCK_DELAY_MS"] ?? ""
   guard let ms = Int(raw), ms >= 0, ms <= 10_000 else { return 0.248 }
@@ -363,28 +358,6 @@ private func outputDuckLevelFromEnv() -> Int {
   let raw = ProcessInfo.processInfo.environment["CODICTATE_OUTPUT_DUCK_LEVEL"] ?? "0"
   guard let value = Int(raw) else { return 0 }
   return max(0, min(100, value))
-}
-
-private func installStreamSignalHandlersForCleanup() {
-  signal(SIGPIPE, SIG_IGN)
-
-  let cleanupAndExit: @convention(block) () -> Void = {
-    StreamOutputDuckCoordinator.shared.end()
-    exit(0)
-  }
-
-  let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global(qos: .userInitiated))
-  sigint.setEventHandler(handler: cleanupAndExit)
-  signal(SIGINT, SIG_IGN)
-  sigint.resume()
-
-  let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global(qos: .userInitiated))
-  sigterm.setEventHandler(handler: cleanupAndExit)
-  signal(SIGTERM, SIG_IGN)
-  sigterm.resume()
-
-  StreamSignalHandlers.sigint = sigint
-  StreamSignalHandlers.sigterm = sigterm
 }
 
 // MARK: - Main
@@ -479,16 +452,21 @@ struct CodictateParakeetHelperMain {
     logPhase("transcribe session: stdin closed")
   }
 
-  // MARK: - stream (mic → inject text locally; no stdout protocol)
+  // MARK: - stream (mic → NDJSON events on stdout)
 
-  /// Stream modes capture from the mic, transcribe with Parakeet TDT, and inject text
-  /// into the focused app via the same clipboard + Cmd+V path as KeyListener.
-  /// Stdout is unused; the Bun host only spawns/stops this process.
+  /// Stream modes capture from the mic, transcribe with Parakeet TDT, and report what they
+  /// heard as NDJSON events on stdout (`StreamEventSink`). Nothing is injected into the focused
+  /// app: Bun keeps the running transcript and pastes once when the Dictation ends.
   ///
-  /// **vad** — RMS VAD, one batch transcription per utterance (silence commit), paste + space.
+  /// **vad** — RMS VAD, one batch transcription per utterance (silence commit), one `commit`
+  ///           per utterance. ITN applied.
   ///
   /// **live** — Re-transcribe the growing buffer on a cadence (≥1s audio, no partial padding),
-  ///            updating the focused field with append-or-LCP-replace. Raw ASR text (no ITN).
+  ///            writing each new hypothesis as a `partial` and the segment's final pass as a
+  ///            `commit`. Raw ASR text (no ITN).
+  ///
+  /// A stop (`stop` on stdin, stdin EOF, SIGINT or SIGTERM) ends the audio loop, transcribes the
+  /// segment in progress, writes `final` and exits 0. See `StreamStopRequest`.
   static func streamCommand(_ args: [String]) async throws {
     guard args.count >= 2 else { usage() }
     let mode = args[0]
@@ -504,13 +482,21 @@ struct CodictateParakeetHelperMain {
       StreamSessionLog.stderrTag = ""
     }
 
-    logPhase("stream [\(mode)]: loading models…")
-    let models = try await loadAsrModels(parakeetDir: modelDir)
-    logPhase("stream [\(mode)]: models ready")
-    installStreamSignalHandlersForCleanup()
     let duckBuiltInOutput = outputDuckBuiltInEnabledFromEnv()
     let duckHeadphoneOutput = outputDuckHeadphonesEnabledFromEnv()
     let duckLevel = outputDuckLevelFromEnv()
+    let endOutputDuck: @Sendable () -> Void = {
+      if duckBuiltInOutput || duckHeadphoneOutput {
+        StreamOutputDuckCoordinator.shared.end()
+      }
+    }
+    // Installed before the model load, so a stop that lands during it still ends the session
+    // with a `final` rather than an unhandled signal.
+    installStreamStopHandlers(cleanup: endOutputDuck)
+
+    logPhase("stream [\(mode)]: loading models…")
+    let models = try await loadAsrModels(parakeetDir: modelDir)
+    logPhase("stream [\(mode)]: models ready")
     if duckBuiltInOutput || duckHeadphoneOutput {
       StreamOutputDuckCoordinator.shared.begin(
         delaySeconds: outputDuckDelaySecondsFromEnv(),
@@ -518,17 +504,17 @@ struct CodictateParakeetHelperMain {
         headphonesEnabled: duckHeadphoneOutput,
         headphoneLevel: duckLevel)
     }
-    defer {
-      if duckBuiltInOutput || duckHeadphoneOutput {
-        StreamOutputDuckCoordinator.shared.end()
-      }
-    }
+    // A thrown error exits 1 from `main` without passing through the sink.
+    defer { endOutputDuck() }
 
     if mode == "vad" {
       try await runVadMode(models: models, deviceIndex: deviceIndex)
     } else {
       try await runLiveMode(models: models, deviceIndex: deviceIndex)
     }
+
+    // The audio loop only ends on a stop, and it has already committed its last segment.
+    StreamEventSink.shared.finishAndExit(cleanup: endOutputDuck)
   }
 
   // MARK: VAD mode
@@ -558,6 +544,8 @@ struct CodictateParakeetHelperMain {
 
     try engine.start()
     logPhase("stream [vad]: audio engine running")
+    // A stop finishes the stream; chunks already queued are still delivered, then the loop ends.
+    StreamStopRequest.shared.setDrain { audioContinuation.finish() }
 
     // VAD parameters (16 kHz sample counts)
     let rmsThreshold: Float = 0.012   // energy gate
@@ -583,7 +571,7 @@ struct CodictateParakeetHelperMain {
 
         // Hard cap — force a transcription and keep going
         if utterance.count >= maxUtterance {
-          await transcribeVadAndInject(asr: asr, samples: utterance)
+          await transcribeVadAndCommit(asr: asr, samples: utterance)
           utterance = []
         }
       } else if inSpeech {
@@ -595,21 +583,31 @@ struct CodictateParakeetHelperMain {
           silenceAccum = 0
           logPhase("stream [vad]: speech end — transcribing \(utterance.count) samples")
           if utterance.count >= minUtterance {
-            await transcribeVadAndInject(asr: asr, samples: utterance)
+            await transcribeVadAndCommit(asr: asr, samples: utterance)
           }
           utterance = []
         }
       }
     }
+
+    engine.stop()
+    inputNode.removeTap(onBus: 0)
+    // Stopped mid-utterance: the speech never reached its silence commit, and with push-to-talk
+    // that is the usual case for the last thing said.
+    if inSpeech && utterance.count >= minUtterance {
+      logPhase("stream [vad]: stopped mid-utterance — transcribing \(utterance.count) samples")
+      await transcribeVadAndCommit(asr: asr, samples: utterance)
+    }
   }
 
-  private static func transcribeVadAndInject(asr: AsrManager, samples: [Float]) async {
+  private static func transcribeVadAndCommit(asr: AsrManager, samples: [Float]) async {
     do {
-      let result = try await asr.transcribe(samples, source: .microphone)
+      let result = try await asr.transcribe(
+        padToMinimumTranscribeLength(samples), source: .microphone)
       let text = applyInverseTextNormalization(result.text)
       guard !text.isEmpty else { return }
-      logPhase("stream [vad]: pasting \(text.count) chars")
-      await StreamInjection.pasteOnly(text + " ")
+      logPhase("stream [vad]: committing \(text.count) chars")
+      StreamEventSink.shared.commit(text)
     } catch {
       logPhase("stream [vad]: transcription error: \(error)")
     }
@@ -640,14 +638,16 @@ struct CodictateParakeetHelperMain {
 
     try engine.start()
     logPhase("stream [live]: audio engine running")
+    // A stop finishes the stream; chunks already queued are still delivered, then the loop ends.
+    StreamStopRequest.shared.setDrain { audioContinuation.finish() }
     if liveStreamDebugEnabled() {
       logPhase(
         "stream [live][debug] CODICTATE_LIVE_DEBUG on — logging partials, commits, discards")
     }
 
     // FluidAudio rejects < 1s of audio (`invalidAudioData`). Do not zero-pad partial
-    // snapshots — padding makes TDT hallucinate long junk, then finals are shorter and
-    // the UI deletes huge spans. Partials only run on real ≥1s buffers; short tails
+    // snapshots — padding makes TDT hallucinate long junk, then finals are shorter than the
+    // partials the user just watched. Partials only run on real ≥1s buffers; short tails
     // are padded only once at utterance end.
     let rmsThreshold: Float = 0.010
     // ~1.5s @ 16kHz — longer than brief phrase gaps so one PTT hold stays fewer segments / less churn.
@@ -656,11 +656,10 @@ struct CodictateParakeetHelperMain {
     // FluidAudio requires ≥1s of audio per call; cannot go lower for first partial.
     let minSamplesForInfer = 16_000
     // How much new 16kHz audio between re-transcribe passes (~300ms). Smaller =
-    // snappier UI but more ANE work; wall time is still dominated by TDT on long buffers.
+    // snappier partials but more ANE work; wall time is still dominated by TDT on long buffers.
     let minSamplesBetweenUpdates = 4_800
     let maxUtterance = 16_000 * 20
 
-    var committedText = ""
     var utterance: [Float] = []
     var inSpeech = false
     /// Live mode only: increments when the RMS gate opens a new segment after a silence commit (same process).
@@ -668,9 +667,35 @@ struct CodictateParakeetHelperMain {
     var silenceAccum = 0
     var samplesSinceLastUpdate = 0
     var lastLiveText = ""
-    var injectedDisplay = ""
+
+    /// The segment's final pass, written as a `commit`. Falls back to the last partial when
+    /// the full-buffer pass comes back empty, so a segment the user watched does not vanish.
+    func commitUtterance(_ samples: [Float], lastPartial: String, reason: String) async throws {
+      let finalInput =
+        samples.count >= minSamplesForInfer
+        ? samples
+        : padToMinimumTranscribeLength(samples)
+      let rawFinal = try await asr
+        .transcribe(finalInput, source: .microphone)
+        .text
+      let finalText = resolveLiveUtteranceText(finalRaw: rawFinal, lastPartial: lastPartial)
+      let fallback =
+        rawFinal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        && !lastPartial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      logLiveDebug(
+        "commit[\(reason)] samples=\(finalInput.count) fallbackToPartial=\(fallback) text=\(debugSnippet(finalText))"
+      )
+      StreamEventSink.shared.commit(finalText)
+    }
 
     for await chunk in audioStream {
+      // Stopping: chunks still queued behind a slow pass only extend the segment in progress.
+      // Re-transcribing for partials nobody will see would spend the drain deadline.
+      if StreamStopRequest.shared.isRequested {
+        if inSpeech { utterance.append(contentsOf: chunk) }
+        continue
+      }
+
       let rms = sqrt(chunk.map { $0 * $0 }.reduce(0, +) / Float(chunk.count))
 
       if rms >= rmsThreshold {
@@ -698,39 +723,13 @@ struct CodictateParakeetHelperMain {
             .text
           guard !partialText.isEmpty, partialText != lastLiveText else { continue }
           lastLiveText = partialText
-          let fullText = joinTranscript(committedText, partialText)
           logLiveDebug(
             "partial utteranceSamples=\(utterance.count) text=\(debugSnippet(partialText))")
-          await StreamInjection.updateLiveLine(
-            displayed: &injectedDisplay,
-            newFull: fullText
-          )
+          StreamEventSink.shared.partial(partialText)
         }
 
         if utterance.count >= maxUtterance {
-          let finalInput =
-            utterance.count >= minSamplesForInfer
-            ? utterance
-            : padToMinimumTranscribeLength(utterance)
-          let lastPartialSnapshot = lastLiveText
-          let rawFinal = try await asr
-            .transcribe(finalInput, source: .microphone)
-            .text
-          let finalText = resolveLiveUtteranceText(
-            finalRaw: rawFinal, lastPartial: lastPartialSnapshot)
-          let fallback =
-            rawFinal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !lastPartialSnapshot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-          logLiveDebug(
-            "commit[maxUtterance] samples=\(finalInput.count) fallbackToPartial=\(fallback) text=\(debugSnippet(finalText))"
-          )
-          if !finalText.isEmpty {
-            committedText = joinTranscript(committedText, finalText)
-            await StreamInjection.updateLiveLine(
-              displayed: &injectedDisplay,
-              newFull: committedText
-            )
-          }
+          try await commitUtterance(utterance, lastPartial: lastLiveText, reason: "maxUtterance")
           lastLiveText = ""
           utterance = []
           samplesSinceLastUpdate = 0
@@ -745,29 +744,7 @@ struct CodictateParakeetHelperMain {
           logPhase(
             "stream [live]: segment #\(utteranceSegmentIndex) — silence commit (finalising)")
           if utterance.count >= minUtterance {
-            let finalInput =
-              utterance.count >= minSamplesForInfer
-              ? utterance
-              : padToMinimumTranscribeLength(utterance)
-            let lastPartialSnapshot = lastLiveText
-            let rawFinal = try await asr
-              .transcribe(finalInput, source: .microphone)
-              .text
-            let finalText = resolveLiveUtteranceText(
-              finalRaw: rawFinal, lastPartial: lastPartialSnapshot)
-            let fallback =
-              rawFinal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-              && !lastPartialSnapshot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            logLiveDebug(
-              "commit[silence] samples=\(finalInput.count) fallbackToPartial=\(fallback) text=\(debugSnippet(finalText))"
-            )
-            if !finalText.isEmpty {
-              committedText = joinTranscript(committedText, finalText)
-              await StreamInjection.updateLiveLine(
-                displayed: &injectedDisplay,
-                newFull: committedText
-              )
-            }
+            try await commitUtterance(utterance, lastPartial: lastLiveText, reason: "silence")
           } else {
             logLiveDebug(
               "discard[short] utteranceSamples=\(utterance.count) min=\(minUtterance) (no commit)")
@@ -776,6 +753,19 @@ struct CodictateParakeetHelperMain {
           samplesSinceLastUpdate = 0
           lastLiveText = ""
         }
+      }
+    }
+
+    engine.stop()
+    inputNode.removeTap(onBus: 0)
+    // Stopped mid-segment, which with push-to-talk is how the last segment always ends. A
+    // failed final pass is not a failed session: the sink still commits the last partial.
+    if inSpeech && (utterance.count >= minUtterance || !lastLiveText.isEmpty) {
+      logPhase("stream [live]: segment #\(utteranceSegmentIndex) — stop commit (finalising)")
+      do {
+        try await commitUtterance(utterance, lastPartial: lastLiveText, reason: "stop")
+      } catch {
+        logPhase("stream [live]: stop commit failed: \(error)")
       }
     }
   }

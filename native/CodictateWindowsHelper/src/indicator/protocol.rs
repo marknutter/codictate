@@ -9,7 +9,18 @@ pub enum IndicatorStatus {
     Transcribing,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// The light/dark preference Bun sends. The orb keeps its dark look in every theme; the
+/// Staging Overlay's text panel follows it. `system` draws dark, like the orb.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IndicatorTheme {
+    Light,
+    #[default]
+    Dark,
+    System,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "command")]
 pub enum IndicatorCommand {
     #[serde(rename = "show")]
@@ -19,11 +30,24 @@ pub enum IndicatorCommand {
         width: i32,
         height: i32,
         status: IndicatorStatus,
+        #[serde(default)]
+        theme: Option<IndicatorTheme>,
     },
     #[serde(rename = "hide")]
     Hide,
     #[serde(rename = "status")]
     Status { status: IndicatorStatus },
+    #[serde(rename = "theme")]
+    Theme { theme: IndicatorTheme },
+    /// The Staging Overlay's text. Drawn as `committed` followed by `partial`, verbatim; both
+    /// empty collapses the window back to the orb.
+    #[serde(rename = "text")]
+    Text {
+        #[serde(default)]
+        committed: String,
+        #[serde(default)]
+        partial: String,
+    },
     #[serde(rename = "quit")]
     Quit,
 }

@@ -374,7 +374,8 @@ function isParakeetPreparing(
 
 /**
  * Batch Dictation records to a file and transcribes it once; Live Transcription streams
- * into the Parakeet Native Helper, which captures and pastes for itself. One union rather
+ * into the Parakeet Native Helper, which captures and reports its text as it goes, and is
+ * pasted once when it ends. One union rather
  * than two, because the shortcut press has to pick between them and every surface that
  * reports a Dictation has to report either.
  */
