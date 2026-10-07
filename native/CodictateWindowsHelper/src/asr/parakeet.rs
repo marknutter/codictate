@@ -1,4 +1,4 @@
-use crate::audio::capture::{InputSampleStream, open_input_sample_stream, spawn_stdin_stop_thread};
+use crate::audio::capture::{InputSampleStream, open_input_sample_stream};
 use crate::audio::resample::{RECORDING_SAMPLE_RATE, StreamingResampler};
 use crate::ipc::emit_json;
 use parakeet_rs::{ExecutionConfig, ExecutionProvider, ParakeetTDT, TimestampMode, Transcriber};
@@ -7,8 +7,8 @@ use std::cmp::Ordering;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -61,37 +61,211 @@ struct StreamFinalEvent {
 /// - `partial` - the current hypothesis for the segment in progress; replaces the last one.
 /// - `commit` - a finished segment; clears the partial. An empty commit only clears it.
 /// - `final` - the session ended normally, after the last commit.
+///
+/// Shared by the audio loop and the stop path (the stdin thread and the drain deadline), so
+/// every write happens under one lock and only the first `finish` writes `final`; nothing is
+/// written after it. The macOS helper's `StreamEventSink` follows the same rule.
 #[derive(Default)]
 struct StreamEvents {
-    partial_in_flight: bool,
+    state: Mutex<StreamEventsState>,
+}
+
+#[derive(Default)]
+struct StreamEventsState {
+    /// The last partial written and not yet committed. A finish that the audio loop did not
+    /// reach commits it, so the words the user saw are the words pasted.
+    in_flight_partial: String,
+    finished: bool,
 }
 
 impl StreamEvents {
-    fn partial(&mut self, text: &str) -> Result<(), String> {
-        self.partial_in_flight = true;
-        emit_json(&StreamTextEvent {
-            kind: "partial",
-            text,
-        })
-        .map_err(|err| format!("failed to write partial event: {err}"))
+    fn lock(&self) -> MutexGuard<'_, StreamEventsState> {
+        // A panic while holding the lock leaves nothing half-written that matters more than
+        // still being able to write `final`.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn commit(&mut self, text: &str) -> Result<(), String> {
-        if text.is_empty() && !self.partial_in_flight {
+    fn partial(&self, text: &str) -> Result<(), String> {
+        let mut state = self.lock();
+        if state.finished {
             return Ok(());
         }
-        self.partial_in_flight = false;
-        emit_json(&StreamTextEvent {
-            kind: "commit",
-            text,
-        })
-        .map_err(|err| format!("failed to write commit event: {err}"))
+        state.in_flight_partial = text.to_string();
+        emit_text_event("partial", text)
     }
 
-    fn finish(self) -> Result<(), String> {
+    fn commit(&self, text: &str) -> Result<(), String> {
+        let mut state = self.lock();
+        if state.finished {
+            return Ok(());
+        }
+        if text.is_empty() && state.in_flight_partial.is_empty() {
+            return Ok(());
+        }
+        state.in_flight_partial.clear();
+        emit_text_event("commit", text)
+    }
+
+    /// Ends the session normally: commits the partial still in flight, if any, then writes
+    /// `final`. Does nothing when the session already finished. Each event is flushed as it is
+    /// written (`emit_json`).
+    fn finish(&self) -> Result<(), String> {
+        let mut state = self.lock();
+        Self::finish_locked(&mut state)
+    }
+
+    /// `finish`, then exit the process at once - from the stop path, while the audio loop may
+    /// still be inside a model load or a transcription pass that cannot be interrupted. The lock
+    /// is held until the process is gone, so the loop cannot write after `final`. Exits 0 when
+    /// `final` was written (by this caller or an earlier one), 1 when writing it failed.
+    fn finish_and_exit(&self) -> ! {
+        let mut state = self.lock();
+        let code = match Self::finish_locked(&mut state) {
+            Ok(()) => 0,
+            Err(err) => {
+                log_phase(format!("stream: {err}"));
+                1
+            }
+        };
+        std::process::exit(code)
+    }
+
+    fn finish_locked(state: &mut StreamEventsState) -> Result<(), String> {
+        if state.finished {
+            return Ok(());
+        }
+        state.finished = true;
+        let pending = clean_transcript(&std::mem::take(&mut state.in_flight_partial));
+        if !pending.is_empty() {
+            emit_text_event("commit", &pending)?;
+        }
         emit_json(&StreamFinalEvent { kind: "final" })
             .map_err(|err| format!("failed to write final event: {err}"))
     }
+}
+
+fn emit_text_event(kind: &'static str, text: &str) -> Result<(), String> {
+    emit_json(&StreamTextEvent { kind, text })
+        .map_err(|err| format!("failed to write {kind} event: {err}"))
+}
+
+/// How long the audio loop gets to finish its last segment after a stop, matching the macOS
+/// helper's `StreamStopRequest.drainDeadlineSeconds`. Bun kills a helper that has not exited
+/// 6s after the stop (`STREAM_STOP_DEADLINE_MS`) and reports the session as failed; this keeps
+/// the helper well inside that.
+const STREAM_STOP_DRAIN_DEADLINE: Duration = Duration::from_secs(3);
+
+/// What a stop does, decided by whether one already arrived and whether the audio loop exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopResponse {
+    /// No audio loop to drain yet - the model is still loading, or the input is opening. Write
+    /// `final` and exit now: nothing was heard, and the load alone can outlast Bun's deadline.
+    FinishNow,
+    /// The audio loop is running. Let it drain and commit the segment in progress, under
+    /// `STREAM_STOP_DRAIN_DEADLINE`.
+    DrainUnderDeadline,
+    /// A stop is already being handled.
+    AlreadyStopping,
+}
+
+fn stop_response(already_requested: bool, audio_loop_running: bool) -> StopResponse {
+    match (already_requested, audio_loop_running) {
+        (true, _) => StopResponse::AlreadyStopping,
+        (false, true) => StopResponse::DrainUnderDeadline,
+        (false, false) => StopResponse::FinishNow,
+    }
+}
+
+/// The stop half of a stream session. The audio loop polls `is_requested`; the stdin thread
+/// calls `request`. The lock makes "the loop starts" and "a stop arrives" one ordering, so a
+/// stop is either seen by a running loop or finishes the session itself, never neither.
+#[derive(Default)]
+struct StreamStop {
+    requested: AtomicBool,
+    state: Mutex<StreamStopState>,
+}
+
+#[derive(Default)]
+struct StreamStopState {
+    requested: bool,
+    audio_loop_running: bool,
+}
+
+impl StreamStop {
+    fn lock(&self) -> MutexGuard<'_, StreamStopState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(AtomicOrdering::SeqCst)
+    }
+
+    /// The audio loop is about to run. False when a stop got here first: its handler has
+    /// already finished the session, and the loop must not start.
+    fn begin_audio_loop(&self) -> bool {
+        let mut state = self.lock();
+        if state.requested {
+            return false;
+        }
+        state.audio_loop_running = true;
+        true
+    }
+
+    fn request(&self) -> StopResponse {
+        let mut state = self.lock();
+        let response = stop_response(state.requested, state.audio_loop_running);
+        state.requested = true;
+        self.requested.store(true, AtomicOrdering::SeqCst);
+        response
+    }
+}
+
+/// One Live Transcription session's shared state: what has been written, and whether it is
+/// stopping. Shared by the audio loop, the stdin thread and the drain deadline.
+#[derive(Default)]
+struct StreamSession {
+    events: StreamEvents,
+    stop: StreamStop,
+}
+
+/// Every stop lands here. A stop before the audio loop exists finishes the session at once; the
+/// first stop once it runs arms the drain deadline, which finishes the session with the last
+/// partial if the loop has not finished it by then.
+fn handle_stream_stop(session: &Arc<StreamSession>, source: &str) {
+    let response = session.stop.request();
+    log_phase(format!("stream: stop requested ({source}): {response:?}"));
+    match response {
+        StopResponse::FinishNow => session.events.finish_and_exit(),
+        StopResponse::DrainUnderDeadline => {
+            let session = Arc::clone(session);
+            thread::spawn(move || {
+                thread::sleep(STREAM_STOP_DRAIN_DEADLINE);
+                log_phase("stream: drain deadline passed - finishing with the last partial");
+                session.events.finish_and_exit();
+            });
+        }
+        StopResponse::AlreadyStopping => {}
+    }
+}
+
+/// The stream session's stop channel: a `stop` line on stdin, or stdin closing (the host went
+/// away, or Bun closed the pipe after writing `stop`). Bun cannot signal a Windows process
+/// gracefully. Only the first of those counts: Bun writes `stop` and closes stdin straight
+/// after, and that close must not cut the drain short.
+fn spawn_stream_stdin_thread(session: Arc<StreamSession>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if line.trim().eq_ignore_ascii_case("stop") {
+                handle_stream_stop(&session, "stdin stop");
+                return;
+            }
+        }
+        handle_stream_stop(&session, "stdin closed");
+    })
 }
 
 fn log_phase(message: impl AsRef<str>) {
@@ -345,13 +519,13 @@ pub fn handle_stream(args: &[String]) -> ExitCode {
     let mode = &args[2];
     let model_dir = &args[3];
     let device_ref = args.get(4).map(String::as_str);
-    // Same stop contract as `record`: a `stop` line on stdin, or stdin closing. Bun cannot
-    // signal a Windows process gracefully, and a stop has to let the session write `final`.
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let _stdin_thread = spawn_stdin_stop_thread(stop_flag.clone());
+    // Started before the model load, so a stop that lands during it still ends the session
+    // with a `final` instead of waiting out a DirectML load. See `handle_stream_stop`.
+    let session = Arc::new(StreamSession::default());
+    let _stdin_thread = spawn_stream_stdin_thread(Arc::clone(&session));
     let result = match mode.as_str() {
-        "vad" => run_vad_stream(model_dir, device_ref, &stop_flag),
-        "live" => run_live_stream(model_dir, device_ref, &stop_flag),
+        "vad" => run_vad_stream(model_dir, device_ref, &session),
+        "live" => run_live_stream(model_dir, device_ref, &session),
         other => Err(format!("unknown stream mode: {other}")),
     };
 
@@ -367,16 +541,21 @@ pub fn handle_stream(args: &[String]) -> ExitCode {
 fn run_vad_stream(
     model_dir: &str,
     device_ref: Option<&str>,
-    stop_flag: &AtomicBool,
+    session: &StreamSession,
 ) -> Result<(), String> {
     let mut model = load_model(model_dir)?;
-    let mut events = StreamEvents::default();
-    if stop_flag.load(AtomicOrdering::SeqCst) {
+    let events = &session.events;
+    if session.stop.is_requested() {
         log_phase("stream [vad]: stopped before audio input opened");
         return events.finish();
     }
     let input = open_input_sample_stream(device_ref)?;
     let mut resampler = StreamingResampler::new(input.sample_rate)?;
+    if !session.stop.begin_audio_loop() {
+        log_phase("stream [vad]: stopped while audio input opened");
+        drop(input);
+        return events.finish();
+    }
     log_phase("stream [vad]: audio input running");
 
     const RMS_THRESHOLD: f32 = 0.012;
@@ -389,7 +568,7 @@ fn run_vad_stream(
     let mut silence_accum = 0usize;
 
     loop {
-        if stop_flag.load(AtomicOrdering::SeqCst) {
+        if session.stop.is_requested() {
             log_phase("stream [vad]: stop requested");
             break;
         }
@@ -465,16 +644,21 @@ fn run_vad_stream(
 fn run_live_stream(
     model_dir: &str,
     device_ref: Option<&str>,
-    stop_flag: &AtomicBool,
+    session: &StreamSession,
 ) -> Result<(), String> {
     let mut model = load_model(model_dir)?;
-    let mut events = StreamEvents::default();
-    if stop_flag.load(AtomicOrdering::SeqCst) {
+    let events = &session.events;
+    if session.stop.is_requested() {
         log_phase("stream [live]: stopped before audio input opened");
         return events.finish();
     }
     let input = open_input_sample_stream(device_ref)?;
     let mut resampler = StreamingResampler::new(input.sample_rate)?;
+    if !session.stop.begin_audio_loop() {
+        log_phase("stream [live]: stopped while audio input opened");
+        drop(input);
+        return events.finish();
+    }
     log_phase("stream [live]: audio input running");
 
     const RMS_THRESHOLD: f32 = 0.010;
@@ -491,7 +675,7 @@ fn run_live_stream(
     let mut last_partial_text = String::new();
 
     loop {
-        if stop_flag.load(AtomicOrdering::SeqCst) {
+        if session.stop.is_requested() {
             log_phase("stream [live]: stop requested");
             break;
         }
@@ -519,8 +703,11 @@ fn run_live_stream(
                     utterance.extend_from_slice(chunk);
                     samples_since_last_update += chunk.len();
 
+                    // Stopping: a partial pass nobody will see would only spend the drain
+                    // deadline the stop commit needs.
                     let should_emit_update = utterance.len() >= MIN_SAMPLES_FOR_INFER
-                        && samples_since_last_update >= MIN_SAMPLES_BETWEEN_UPDATES;
+                        && samples_since_last_update >= MIN_SAMPLES_BETWEEN_UPDATES
+                        && !session.stop.is_requested();
                     if should_emit_update {
                         samples_since_last_update = 0;
                         if let Some(partial_text) = transcribe_for_stream(&mut model, &utterance)
@@ -533,12 +720,7 @@ fn run_live_stream(
                     }
 
                     if utterance.len() >= MAX_UTTERANCE {
-                        commit_live_utterance(
-                            &mut model,
-                            &mut events,
-                            &utterance,
-                            &last_partial_text,
-                        )?;
+                        commit_live_utterance(&mut model, events, &utterance, &last_partial_text)?;
                         utterance.clear();
                         samples_since_last_update = 0;
                         last_partial_text.clear();
@@ -555,7 +737,7 @@ fn run_live_stream(
                         if utterance.len() >= MIN_UTTERANCE || !last_partial_text.is_empty() {
                             commit_live_utterance(
                                 &mut model,
-                                &mut events,
+                                events,
                                 &utterance,
                                 &last_partial_text,
                             )?;
@@ -581,7 +763,7 @@ fn run_live_stream(
     // Stopped mid-segment, which with push-to-talk is how the last segment always ends.
     if in_speech && (utterance.len() >= MIN_UTTERANCE || !last_partial_text.is_empty()) {
         log_phase("stream [live]: stop commit");
-        commit_live_utterance(&mut model, &mut events, &utterance, &last_partial_text)?;
+        commit_live_utterance(&mut model, events, &utterance, &last_partial_text)?;
     }
     events.finish()
 }
@@ -620,7 +802,7 @@ fn drain_after_stop(
 /// full-buffer pass fails or comes back empty, so a segment the user watched does not vanish.
 fn commit_live_utterance(
     model: &mut ParakeetTDT,
-    events: &mut StreamEvents,
+    events: &StreamEvents,
     utterance: &[f32],
     last_partial_text: &str,
 ) -> Result<(), String> {
