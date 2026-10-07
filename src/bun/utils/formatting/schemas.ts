@@ -89,3 +89,21 @@ export const documentSchema = {
   },
   required: ['title', 'body'],
 } as const
+
+/** Self-correction Cleanup's result: the same text, with spoken corrections resolved. */
+export interface SelfCorrectedText {
+  text: string
+}
+
+export const selfCorrectionSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    text: {
+      type: 'string',
+      description:
+        'The transcript with spoken self-corrections resolved and every other word unchanged.',
+    },
+  },
+  required: ['text'],
+} as const

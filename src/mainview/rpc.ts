@@ -310,6 +310,14 @@ export async function setFormattingForceModeId(
   })
 }
 
+export async function setSelfCorrectionCleanup(
+  selfCorrectionCleanup: boolean
+): Promise<boolean> {
+  return rpc.request.updateFormattingSettings({
+    patch: { selfCorrectionCleanup },
+  })
+}
+
 export async function setS1FormattingControls(
   s1: Partial<AppSettings['formatting']['s1']>
 ): Promise<boolean> {

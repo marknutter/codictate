@@ -21,6 +21,7 @@ function formattingSettings(): FormattingSettings {
     available: true,
     modelAvailability: { fast: true, quality: false, 's1-mini': false },
     s1: { styling: 'semi-formal', structure: 'prose' },
+    selfCorrectionCleanup: false,
     email: {
       includeSenderName: false,
       greetingStyle: 'auto',

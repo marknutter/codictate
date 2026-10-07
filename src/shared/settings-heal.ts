@@ -17,9 +17,10 @@
  * - **On an availability change, heal.** Never argue with someone deleting multi-gigabyte
  *   weights to get their disk space back. Correct the configuration instead, and say so.
  *
- * Announcements are limited to the three things the user chose deliberately - the Speech
- * Model selection, Translate to English, Live Transcription. The rest is corrected in
- * silence. Silently flipping a toggle the user set is the same class of surprise as a silent
+ * Announcements are limited to the things the user chose deliberately - the Speech Model
+ * selection, Translate to English, Live Transcription, and Self-correction Cleanup (healed
+ * by its own pure rule in self-correction-cleanup.ts, because it depends on the Formatting
+ * Model rather than on anything in this slice). The rest is corrected in silence. Silently flipping a toggle the user set is the same class of surprise as a silent
  * fallback, so the noisy set and the quiet set are drawn on purpose rather than by
  * convenience.
  *
@@ -76,9 +77,13 @@ const RUNNABLE_DICTATION_SETTINGS_KEYS = Object.keys(
   RUNNABLE_DICTATION_SETTINGS_FIELDS
 ) as (keyof RunnableDictationSettings)[]
 
-/** The three user choices the heal pass is allowed to change out loud. */
+/** The user choices a heal pass is allowed to change out loud. */
 export type SettingsHealTarget =
-  'speech_model' | 'translate_to_english' | 'live_transcription'
+  | 'speech_model'
+  | 'translate_to_english'
+  | 'live_transcription'
+  /** Healed by `healSelfCorrectionCleanup`, never by `healDictationSettings`. */
+  | 'self_correction_cleanup'
 
 /**
  * Closed union, so a new way for the configuration to go bad cannot join a generic bucket
@@ -92,6 +97,10 @@ export type SettingsHealReason =
   | 'parakeet_not_installed'
   | 'model_cannot_stream'
   | 'language_not_supported_by_parakeet'
+  /** Self-correction Cleanup: no `llama-completion` binary in this build. */
+  | 'formatting_runtime_missing'
+  /** Self-correction Cleanup: the selected Formatting Model is not on disk. */
+  | 'formatting_model_not_installed'
 
 export interface SettingsHealAnnouncement {
   target: SettingsHealTarget
@@ -266,6 +275,9 @@ const PATCH_OWNS_TARGET: Record<
   speech_model: (patch) => patch.speechModelId !== undefined,
   translate_to_english: (patch) => patch.translateToEnglish === true,
   live_transcription: (patch) => patch.streamMode === true,
+  // Not in the runnable slice, so no transcription patch can ask for it. Its own write arm is
+  // `applySelfCorrectionCleanupPatch`.
+  self_correction_cleanup: () => false,
 }
 
 /**

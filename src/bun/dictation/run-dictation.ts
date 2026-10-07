@@ -12,7 +12,8 @@
  * Transcription Language and the translate flag were all resolved once when the plan was
  * built (ADR-0005), and the audio is a parameter rather than the process-global
  * `RECORDING_PATH`. What is left is the order of the rewrites: the Scratch Command, the
- * shipped brand table, the user Dictionary, then the Formatting Mode.
+ * shipped brand table, the user Dictionary, Self-correction Cleanup when the user turned it on,
+ * then the Formatting Mode.
  *
  * Two entries, one pipeline. `runDictation` is a Batch Dictation: it asks the Speech Engine
  * for a transcript and hands it on. `outcomeFromTranscript` is everything after the engine, and
@@ -33,6 +34,7 @@ import type {
 } from '../../shared/types'
 import { applyDictionary } from '../utils/dictionary/apply-dictionary'
 import { applyFormatting } from '../utils/formatting/apply-formatting'
+import { applySelfCorrectionCleanup } from './self-correction-cleanup'
 import { buildFormatterRequest } from '../utils/formatting/resolve-formatting-request'
 import { runTranscription } from '../utils/whisper/engines/run-transcription'
 import { engineProcessTimeoutMs } from '../utils/whisper/engines/process-supervisor'
@@ -86,11 +88,14 @@ export interface TranscriptOutcomeRequest extends DictationPipelineRequest {
 export interface DictationOutcome {
   status: 'ok'
   /**
-   * After the Scratch Command, the brand table and the Dictionary, before the Formatting
-   * Mode.
+   * After the Scratch Command, the brand table and the Dictionary, before Self-correction
+   * Cleanup and the Formatting Mode.
    */
   raw: string
-  /** What the caller pastes. Equal to `raw` when no Formatting Mode matched. */
+  /**
+   * What the caller pastes. Equal to `raw` when neither Self-correction Cleanup changed it
+   * nor a Formatting Mode matched.
+   */
   output: string
   formattingUsed: boolean
   /** The Speech Model that produced this, as stats names it. */
@@ -184,14 +189,26 @@ export async function outcomeFromTranscript(
   }
 
   const raw = transcript
-  const formatterRequest = await buildFormatterRequest(transcript, {
+  const formattingSettings = {
     ...request.formattingSettings,
     // Translate mode's output is English even though the plan language names its source.
     transcriptionLanguageId: plan.translateToEnglish
       ? 'en'
       : plan.transcriptionLanguageId,
-  })
-  if (formatterRequest === null) return outcome(raw, raw, false)
+  }
+
+  // Self-correction Cleanup: after the Dictionary, before the Formatting Mode, only when
+  // turned on. A failure keeps the uncleaned text and carries on, so it never empties the
+  // paste. See ./self-correction-cleanup.ts.
+  transcript = (
+    await applySelfCorrectionCleanup(transcript, formattingSettings)
+  ).text
+
+  const formatterRequest = await buildFormatterRequest(
+    transcript,
+    formattingSettings
+  )
+  if (formatterRequest === null) return outcome(raw, transcript, false)
 
   // A Formatting Backend failure degrades to the Raw Transcript rather than failing the
   // Dictation - withholding real text because the rewrite failed is worse than pasting it

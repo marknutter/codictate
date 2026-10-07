@@ -47,6 +47,13 @@ import {
   type SettingsHealAnnouncement,
 } from '../../shared/settings-heal'
 import {
+  applySelfCorrectionCleanupPatch,
+  getSelfCorrectionCleanupReadiness,
+  healSelfCorrectionCleanup,
+  type SelfCorrectionCleanupAvailability,
+  type SelfCorrectionCleanupHealResult,
+} from '../../shared/self-correction-cleanup'
+import {
   FORMATTING_MODE_ORDER,
   isValidDocumentStructure,
   isValidDocumentTone,
@@ -137,6 +144,7 @@ function defaultFormattingSettings(
     available,
     modelAvailability,
     s1: { styling: 'semi-formal', structure: 'lists' },
+    selfCorrectionCleanup: false,
     email: {
       includeSenderName: false,
       greetingStyle: 'auto',
@@ -370,6 +378,7 @@ export class AppConfig {
         forceModeId: this.formatting.forceModeId,
         formatterModelTier: this.formatting.formatterModelTier,
         s1: { ...this.formatting.s1 },
+        selfCorrectionCleanup: this.formatting.selfCorrectionCleanup,
         email: { ...this.formatting.email },
         imessage: { ...this.formatting.imessage },
         slack: { ...this.formatting.slack },
@@ -556,6 +565,11 @@ export class AppConfig {
         if (s1.structure === 'prose' || s1.structure === 'lists') {
           this.formatting.s1.structure = s1.structure
         }
+      }
+      // Read as stored; `load()` heals it off afterwards if the Formatting Model it needs
+      // has gone since the last launch.
+      if (typeof formatting.selfCorrectionCleanup === 'boolean') {
+        this.formatting.selfCorrectionCleanup = formatting.selfCorrectionCleanup
       }
       if (
         formatting.enabledModes &&
@@ -867,6 +881,7 @@ export class AppConfig {
     // that always gets to look, so the same heal pass runs here rather than a second
     // field-by-field definition of the same thing.
     await this.healRunnableSettings()
+    await this.healSelfCorrectionCleanup()
   }
 
   private async loadFromDisk() {
@@ -987,6 +1002,10 @@ export class AppConfig {
       modelAvailability: this.dependencies.getModelAvailability(),
       healAnnouncements: this.getHealAnnouncements(),
       dictationReadiness: this.getDictationReadiness(),
+      selfCorrectionCleanupReadiness: getSelfCorrectionCleanupReadiness(
+        this.formatting,
+        this.selfCorrectionCleanupAvailability()
+      ),
       blockedDictation: this.getBlockedDictation(),
       dictationFailure: this.getDictationFailure(),
     }
@@ -1191,6 +1210,7 @@ export class AppConfig {
       userDisplayName: this.userDisplayName,
       formatterModelTier: this.formatting.formatterModelTier,
       s1: { ...this.formatting.s1 },
+      selfCorrectionCleanup: this.formatting.selfCorrectionCleanup,
       email: { ...this.formatting.email },
       imessage: { ...this.formatting.imessage },
       slack: { ...this.formatting.slack },
@@ -1198,13 +1218,65 @@ export class AppConfig {
     }
   }
 
-  /** Re-check whether each formatter model GGUF exists on disk. */
-  public refreshFormatterModelInstalled(): void {
+  /**
+   * Re-check whether each formatter model GGUF exists on disk, then heal Self-correction
+   * Cleanup against the new answer: a removed Formatting Model is never refused, so the
+   * setting that needed it is switched off and announced instead (ADR-0005).
+   */
+  public async refreshFormatterModelInstalled(): Promise<void> {
     this.formatting.modelAvailability = {
       fast: this.dependencies.isFormatterModelInstalled('fast'),
       quality: this.dependencies.isFormatterModelInstalled('quality'),
       's1-mini': this.dependencies.isFormatterModelInstalled('s1-mini'),
     }
+    await this.healSelfCorrectionCleanup()
+  }
+
+  /** The Formatting Model half of the `(settings, availability)` pair, as it stands now. */
+  private selfCorrectionCleanupAvailability(): SelfCorrectionCleanupAvailability {
+    return {
+      formattingAvailable: this.formatting.available,
+      modelAvailability: { ...this.formatting.modelAvailability },
+    }
+  }
+
+  /**
+   * Announce a Self-correction Cleanup correction beside whatever the Speech Model heal pass
+   * last said, rather than replacing it: the two passes run independently and both notices
+   * are still true.
+   */
+  private recordSelfCorrectionCleanupHeal(
+    healed: NonNullable<SelfCorrectionCleanupHealResult['healed']>
+  ): void {
+    this.healAnnouncements = [
+      ...this.healAnnouncements.filter(
+        (announcement) => announcement.target !== 'self_correction_cleanup'
+      ),
+      {
+        target: 'self_correction_cleanup',
+        reason: healed.reason,
+        message: healed.message,
+      },
+    ]
+    log('config', 'healed settings', {
+      target: 'self_correction_cleanup',
+      reason: healed.reason,
+    })
+  }
+
+  /**
+   * The availability arm for Self-correction Cleanup: at boot and after a Formatting Model is
+   * downloaded or removed. Only ever switches it off.
+   */
+  private async healSelfCorrectionCleanup(): Promise<void> {
+    const result = healSelfCorrectionCleanup(
+      this.formatting,
+      this.selfCorrectionCleanupAvailability()
+    )
+    if (result.healed === null) return
+    this.formatting.selfCorrectionCleanup = result.selfCorrectionCleanup
+    this.recordSelfCorrectionCleanupHeal(result.healed)
+    await this.saveMain()
   }
 
   public async updateGeneralSettings(
@@ -1391,6 +1463,27 @@ export class AppConfig {
         's1-mini': this.dependencies.isFormatterModelInstalled('s1-mini'),
       }
     }
+    // Validate the object this write produces, not the patch (ADR-0005): turning Self-
+    // correction Cleanup on while it cannot run is refused, and selecting a Formatting Model
+    // that is not downloaded switches it off out loud.
+    const cleanup = applySelfCorrectionCleanupPatch(
+      next,
+      patch.selfCorrectionCleanup === true,
+      {
+        formattingAvailable: next.available,
+        modelAvailability: next.modelAvailability,
+      }
+    )
+    if (cleanup.kind === 'refused') {
+      log('config', 'refused formatting settings write', {
+        target: 'self_correction_cleanup',
+        reason: cleanup.reason,
+      })
+      return false
+    }
+    next.selfCorrectionCleanup = cleanup.selfCorrectionCleanup
+    if (cleanup.healed !== null)
+      this.recordSelfCorrectionCleanupHeal(cleanup.healed)
     this.formatting = next
     await this.saveMain()
     return true
