@@ -265,7 +265,8 @@ async function runParakeetWarmup(speechModelId: string): Promise<boolean> {
  * warmup clip must be at least that long. At 0.5 s every preparation failed before it compiled
  * anything, and `parakeetCoreMlReady` never became true. Exactly one second transcribes to an
  * empty string; longer silence can make Parakeet hallucinate words, which a warmup ignores
- * but has no reason to invite.
+ * but has no reason to invite. The Windows helper's parakeet-rs 0.3.5 has no minimum beyond
+ * rejecting empty audio, so one second satisfies both platforms.
  */
 export const PARAKEET_WARMUP_SECONDS = 1
 
