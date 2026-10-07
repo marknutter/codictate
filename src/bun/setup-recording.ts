@@ -23,6 +23,7 @@ import {
   type StreamSessionEnd,
 } from './utils/whisper/parakeet-stream-runner'
 import { streamStopCommandFor } from '../shared/parakeet-stream-protocol'
+import { stagedTextForHistory } from '../shared/scratch-command'
 import {
   blockedDictationPlan,
   type BlockedDictationPlan,
@@ -405,9 +406,16 @@ export const setupRecording = (
   /**
    * Keep a Live Transcription's staged text that will not be pasted, so the words are not
    * lost. History only: no paste, and no stats row, because no Dictation Outcome was made.
+   * The Scratch Command is applied first, as the overlay showed it; nothing is saved when
+   * nothing is left.
    */
-  const saveStagedTextToHistory = async (text: string) => {
-    if (text === '' || !onHistorySave) return
+  const saveStagedTextToHistory = async (
+    plan: RunnableDictationPlan,
+    stagedText: string
+  ) => {
+    if (!onHistorySave) return
+    const text = stagedTextForHistory(stagedText, plan.transcriptionLanguageId)
+    if (text === '') return
     try {
       await onHistorySave(text)
     } catch (err) {
@@ -514,7 +522,7 @@ export const setupRecording = (
           exitCode: end.exitCode,
           diagnostic: end.diagnostic,
         })
-        await saveStagedTextToHistory(end.text)
+        await saveStagedTextToHistory(plan, end.text)
         // An app-initiated stop has its own surface already (quit, a settings change, a
         // blocked press). Only a Dictation the user was running reports the failure.
         if (intent === 'commit') {
@@ -525,7 +533,7 @@ export const setupRecording = (
           )
         }
       } else if (intent === 'abandon') {
-        await saveStagedTextToHistory(end.text)
+        await saveStagedTextToHistory(plan, end.text)
       } else {
         // The previous Dictation's Dictionary hits are promoted now, before this one records
         // its own - the same bookkeeping a Batch Dictation does.

@@ -106,3 +106,20 @@ export function applyScratchCommand(text: string): string {
 
   return kept.trim()
 }
+
+/**
+ * A Live Transcription's staged text as History keeps it when it is not pasted (a failed
+ * session, or a stop the app made): with the Scratch Command applied by the same rule the
+ * Staging Overlay showed and the paste would have used, so a phrase the user watched
+ * disappear does not come back in History. Trimmed; an empty result means nothing is left to
+ * keep. Pass the Dictation Plan's Transcription Language.
+ */
+export function stagedTextForHistory(
+  text: string,
+  transcriptionLanguageId: string
+): string {
+  const scratched = scratchCommandAppliesToLanguage(transcriptionLanguageId)
+    ? applyScratchCommand(text)
+    : text
+  return scratched.trim()
+}
