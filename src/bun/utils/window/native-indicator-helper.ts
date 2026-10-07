@@ -1,21 +1,9 @@
 import { findBinary } from '../../platform/binaries'
 import type { AppStatus, ThemePreference } from '../../../shared/types'
 import { getPlatformRuntime } from '../../platform/runtime'
+import { indicatorWireStatus } from './indicator-state'
 
 type MoveEvent = { type: 'move'; x?: number; y?: number }
-
-function statusToWire(
-  status: AppStatus
-): 'ready' | 'recording' | 'transcribing' {
-  switch (status) {
-    case 'recording':
-      return 'recording'
-    case 'transcribing':
-      return 'transcribing'
-    default:
-      return 'ready'
-  }
-}
 
 export type NativeIndicatorHelper = {
   show: (
@@ -87,7 +75,7 @@ export function createNativeIndicatorHelper(
       send({
         command: 'show',
         ...frame,
-        status: statusToWire(status),
+        status: indicatorWireStatus(status),
         ...(theme ? { theme } : {}),
       })
     },
@@ -95,7 +83,7 @@ export function createNativeIndicatorHelper(
       send({ command: 'hide' })
     },
     setStatus(status) {
-      send({ command: 'status', status: statusToWire(status) })
+      send({ command: 'status', status: indicatorWireStatus(status) })
     },
     setTheme(theme) {
       send({ command: 'theme', theme })
