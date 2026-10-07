@@ -19,6 +19,8 @@ A Transcription Request is deliberately not a Dictation Plan. AGENTS.md forbids 
 
 ## Live Transcription is outside the interface
 
+_Superseded by ADR-0008: the helpers now stream their text back and Codictate owns the paste in both modes._
+
 Live Transcription cannot return a result. The Parakeet Native Helper captures the mic, runs the model and pastes, and nothing is read from its stdout. It is a session lifecycle - start, stop - not a request-and-result call.
 
 Rather than give the interface a third method that one of two adapters implements and one of two callers uses, `startParakeetStream` stays outside it entirely. This is a real asymmetry and it is chosen, not overlooked: in Batch Dictation, Codictate owns the paste; in Live Transcription, the Native Helper does. Making the helper stream finals back so TS could paste them is a latency change and a protocol change in two native helpers, on both macOS and Windows, and it is a decision for its own day.

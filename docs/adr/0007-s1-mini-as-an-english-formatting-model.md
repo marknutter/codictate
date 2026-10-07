@@ -10,7 +10,7 @@ This keeps model selection separate from the requested writing behaviour. Reusin
 
 With S1-mini selected and formatting enabled, every completed Batch Dictation receives English cleanup, regardless of the destination app. The general default is standard written English with contractions retained and automatic list formatting. Structure always uses `lists`, allowing bullets for clear enumerations of at least three items and prose otherwise. Users can choose the model's supported writing styles; matching enabled app presets refine the supported settings. An unmatched app uses the general settings. Turning formatting off disables S1-mini, including when a forced preset is saved.
 
-Live Transcription is excluded. It inserts text while the user speaks, and rewriting already-inserted text would require a separate interaction design and native protocol change.
+Live Transcription is excluded. It inserts text while the user speaks, and rewriting already-inserted text would require a separate interaction design and native protocol change. _Amended by ADR-0008: Live Transcription now pastes once at commit, so S1-mini applies to it._
 
 There is no latency acceptance target for this release. Users opt into the model and decide whether its speed and output suit them. Runtime correctness and resource safety still require validation; a small download is not a measured memory budget.
 

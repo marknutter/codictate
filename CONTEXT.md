@@ -8,7 +8,7 @@ Canonical terms for Codictate. Glossary only: no implementation details, no plan
 
 **Dictation Plan** - the fully resolved description of what a single Dictation will do: which Speech Engine and Speech Model run it, in which Transcription Language, whether Translate to English applies, and whether it is a Live Transcription. A Dictation Plan is either runnable or blocked. Codictate never adapts a Dictation to an unrunnable state - it keeps the state runnable instead - so a blocked plan means something changed outside the app, and it names the reason rather than starting a Dictation that cannot do what was asked.
 
-**Dictation Outcome** - what a finished Batch Dictation produced: the Raw Transcript, the text after the Dictionary and the Formatting Mode were applied, and a record of which Speech Engine and Transcription Language actually ran it. A Dictation Outcome is a value handed back to whatever started the Dictation; placing the text at the cursor is that caller's job, not the run's. Live Transcription produces no Dictation Outcome, because its Native Helper pastes the text itself and Codictate never sees it. See `docs/adr/0006-dictation-returns-an-outcome.md`.
+**Dictation Outcome** - what a finished Batch Dictation produced: the Raw Transcript, the text after the Dictionary and the Formatting Mode were applied, and a record of which Speech Engine and Transcription Language actually ran it. A Dictation Outcome is a value handed back to whatever started the Dictation; placing the text at the cursor is that caller's job, not the run's. Live Transcription produces one too: its staged text goes through the same pipeline when it ends. See `docs/adr/0006-dictation-returns-an-outcome.md` and `docs/adr/0008-live-transcription-stages-in-an-overlay.md`.
 
 **Dictation Shortcut** - the key combination that starts and ends a Dictation. Codictate has two independent slots: the primary shortcut (supports both Hold and Tap) and an optional second shortcut (Hold only).
 
@@ -48,13 +48,19 @@ Canonical terms for Codictate. Glossary only: no implementation details, no plan
 
 **Translate to English** - a mode where the Speech Engine outputs English regardless of the spoken language, rather than transcribing verbatim. Distinct from Transcription Language, which selects the input language.
 
-**Live Transcription** - a mode where partial text appears while the user is still speaking, rather than only after the Dictation ends. Requires Parakeet, and a Transcription Language that Parakeet supports. Parakeet detects the spoken language itself, so the user does not choose one: the Transcription Language is automatic for the whole time Parakeet is the selected Speech Model. Previously labelled "Stream mode".
+**Live Transcription** - a mode where partial text appears in the Staging Overlay while the user is still speaking, and is pasted once when the Dictation ends. Requires Parakeet, and a Transcription Language that Parakeet supports. Parakeet detects the spoken language itself, so the user does not choose one: the Transcription Language is automatic for the whole time Parakeet is the selected Speech Model. Previously labelled "Stream mode".
+
+**Staging Overlay** - the floating panel that shows a Live Transcription's running text. Nothing reaches the focused app until the Dictation ends. It is the recording indicator grown into a text panel, and never takes focus. See `docs/adr/0008-live-transcription-stages-in-an-overlay.md`.
+
+**Scratch Command** - the spoken phrase "scratch that", which removes itself and the phrase before it from the transcript. A text rule, not a model.
 
 ## Formatting
 
 **Raw Transcript** - the text a Speech Engine produced, before any rewriting.
 
 **Formatting Mode** - a named rewriting behaviour applied to a Raw Transcript before it is pasted (for example turning spoken words into an email). "Off" is a Formatting Mode.
+
+**Self-correction Cleanup** - an optional step that resolves spoken self-corrections ("at three, no, four" becomes "at four") using the selected Formatting Model, after the Dictionary and before the Formatting Mode. Distinct from a Formatting Mode, which changes how the text reads rather than what it says.
 
 **Formatting Backend** - what executes a Formatting Mode: llama.cpp running a local model, or Apple Intelligence on macOS 26+.
 
