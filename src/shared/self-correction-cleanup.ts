@@ -134,7 +134,7 @@ export function selfCorrectionCleanupHealMessage(
 ): string {
   switch (reason) {
     case 'formatting_runtime_missing':
-      return `${SETTING_LABEL} turned off because the bundled llama.cpp runtime is missing.`
+      return `${SETTING_LABEL} turned off because the bundled llama.cpp runtime that runs ${FORMATTING_MODEL_LABELS[settings.formatterModelTier]} is missing.`
     case 'formatting_model_not_installed':
       return `${SETTING_LABEL} turned off because the ${FORMATTING_MODEL_LABELS[settings.formatterModelTier]} Formatting Model is not installed.`
   }
