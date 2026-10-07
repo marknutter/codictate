@@ -11,8 +11,8 @@
  * Nothing here is decided. The Speech Model, the Speech Engine, the crispasr backend, the
  * Transcription Language and the translate flag were all resolved once when the plan was
  * built (ADR-0005), and the audio is a parameter rather than the process-global
- * `RECORDING_PATH`. What is left is the order of the rewrites: the shipped brand table, the
- * user Dictionary, then the Formatting Mode.
+ * `RECORDING_PATH`. What is left is the order of the rewrites: the Scratch Command, the
+ * shipped brand table, the user Dictionary, then the Formatting Mode.
  *
  * Two entries, one pipeline. `runDictation` is a Batch Dictation: it asks the Speech Engine
  * for a transcript and hands it on. `outcomeFromTranscript` is everything after the engine, and
@@ -23,6 +23,10 @@
  */
 
 import type { RunnableDictationPlan } from '../../shared/dictation-plan'
+import {
+  applyScratchCommand,
+  scratchCommandAppliesToLanguage,
+} from '../../shared/scratch-command'
 import type {
   DictionaryEntry,
   FormattingRuntimeSettings,
@@ -81,7 +85,10 @@ export interface TranscriptOutcomeRequest extends DictationPipelineRequest {
  */
 export interface DictationOutcome {
   status: 'ok'
-  /** After the brand table and the Dictionary, before the Formatting Mode. */
+  /**
+   * After the Scratch Command, the brand table and the Dictionary, before the Formatting
+   * Mode.
+   */
   raw: string
   /** What the caller pastes. Equal to `raw` when no Formatting Mode matched. */
   output: string
@@ -151,10 +158,21 @@ export async function outcomeFromTranscript(
     return outcome('', '', false)
   }
 
-  // The shipped brand table first, then the user Dictionary. Both are app rewrites of what
-  // the Speech Engine said, and both sit above the engine seam so the benchmark scores raw
-  // hypotheses.
-  let transcript = fixBrandMishearings(request.rawTranscript)
+  // The Scratch Command first, so a scratched phrase never reaches the Dictionary and the
+  // Dictionary cannot rewrite the command itself. English and automatic detection only, by
+  // the language the plan ran, not the one selected now.
+  const scratched = scratchCommandAppliesToLanguage(
+    plan.transcriptionLanguageId
+  )
+    ? applyScratchCommand(request.rawTranscript)
+    : request.rawTranscript
+  // A Dictation that scratched everything it said ends like one that said nothing.
+  if (scratched === '') return outcome('', '', false)
+
+  // Then the shipped brand table and the user Dictionary. All three are app rewrites of
+  // what the Speech Engine said, and all sit above the engine seam so the benchmark scores
+  // raw hypotheses.
+  let transcript = fixBrandMishearings(scratched)
   if (request.dictionaryEntries.length > 0) {
     const applied = applyDictionary(transcript, request.dictionaryEntries, {
       trackApplied: true,
